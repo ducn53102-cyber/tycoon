@@ -11,18 +11,50 @@ import {
   generateHumanoidModelGLTFLoaderScript,
   generateCustomerAnimationControllerScript,
   generatePropertyPurchasingScript,
+  generateVipDoorControllerScript,
+  generateHardwarePlacementSystemScript,
 } from '../data/csharpScripts';
-import { Copy, Check, Users, Cpu, Smile, DollarSign, UtensilsCrossed, UserCheck, Sparkles, CheckCircle2, Download, Network, Box, PlayCircle, Building2 } from 'lucide-react';
+import { Copy, Check, Users, Cpu, Smile, DollarSign, UtensilsCrossed, UserCheck, Sparkles, CheckCircle2, Download, Network, Box, PlayCircle, Building2, DoorOpen, Hammer, ShoppingBag } from 'lucide-react';
 
 interface ScriptViewerProps {
   config: ScriptConfig;
 }
 
 export const ScriptViewer: React.FC<ScriptViewerProps> = ({ config }) => {
-  const [activeTab, setActiveTab] = useState<'property_purchasing' | 'gltf_loader' | 'anim_controller' | 'ik_npc' | 'flow' | 'station' | 'queue' | 'money' | 'delivery' | 'satisfaction'>('property_purchasing');
+  const [activeTab, setActiveTab] = useState<'hardware_placement' | 'vip_door' | 'property_purchasing' | 'gltf_loader' | 'anim_controller' | 'ik_npc' | 'flow' | 'station' | 'queue' | 'money' | 'delivery' | 'satisfaction'>('hardware_placement');
   const [copied, setCopied] = useState<boolean>(false);
 
   const scripts = {
+    hardware_placement: {
+      fileName: 'HardwareShopAndPlacementSystem.cs',
+      path: 'Assets/Scripts/Hardware/HardwareShopAndPlacementSystem.cs',
+      title: 'HardwareShopAndPlacementSystem.cs (7 Loại Linh Kiện x 5 Tiers, Balo Inventory [B], Raycast Hologram & Snap Surface)',
+      description: 'Kiến trúc mô phỏng lắp ráp tự do (Internet Cafe Simulator Style): Quản lý 7 loại linh kiện (Monitor, PCCase, Mouse, Keyboard, Headset, Desk, Chair) chia thành 5 Tiers. Tích hợp Balo [B], Raycast Hologram Ghost Mesh có Snapping Surface (Desk & Chair bám Floor; Màn hình, Case, Phím, Chuột, Tai nghe bám Mặt Bàn) và kiểm tra va chạm OverlapBox (Green: Hợp lệ / Red: Trùng lặp).',
+      code: generateHardwarePlacementSystemScript(config),
+      highlights: [
+        '7 Component Types: Monitor, PCCase, Mouse, Keyboard, Headset, Desk, Chair chuẩn enum.',
+        '5 Tiers cấp độ linh kiện: Tier 1 Standard -> Tier 2 Gaming -> Tier 3 Mechanical -> Tier 4 Premium -> Tier 5 Esports.',
+        'Hệ thống Balo Inventory [B]: Mua từ shop vào Balo, click bất kỳ để bắt đầu Build Mode.',
+        'Snapping Surface Logic: Desk và Chair bắt buộc snap Floor; Phụ kiện PC bắt buộc snap Desk Top.',
+        'Collision Validation Hologram: Physics.OverlapBox kiểm tra va chạm (Vật liệu xanh trong suốt 0x00FF00 / Đỏ 0xFF0000).',
+        'Finalize Placement: Nhấn Chuột Trái hoặc [E] sinh prefab thật và trừ món đồ khỏi Balo.',
+      ],
+    },
+    vip_door: {
+      fileName: 'VipDoorController.cs',
+      path: 'Assets/Scripts/VIP/VipDoorController.cs',
+      title: 'VipDoorController.cs (Bản Lề Hinge Pivot, Đồng Bộ BoxCollider isTrigger & NavMesh Update)',
+      description: 'Quản lý bản lề mở cửa phòng VIP (Hinge Pivot đặt tại mép jamb). Đồng bộ BoxCollider: khi cửa mở chuyển sang isTrigger = true (giải phóng physical volume) để người chơi và NPC tự do bước qua lối vào rộng 1.6m mà không bị va chạm với collider tĩnh. Tự động cập nhật NavMeshObstacle (tắt carving khi mở) để AI NavMeshAgent xem khe cửa là đường đi bộ thông suốt.',
+      code: generateVipDoorControllerScript(config),
+      highlights: [
+        'Hinge Pivot Logic: Xoay trục rỗng tại mép cửa (-3.4, 0, -4.8), cánh cửa lệch nửa bề rộng (+0.8m).',
+        'BoxCollider Synchronization: Khi mở cửa, chuyển isTrigger = true (hoặc disable) để không còn vật thể va chạm tĩnh.',
+        'Lối vào rộng chuẩn 1.6m: Đảm bảo capsule người chơi (bán kính 0.3 - 0.5m) bước qua dễ dàng, không bị kẹt mép.',
+        'NavMesh Obstacle Update: Tắt carving khi mở cửa để AI NPC xem lối đi là walkable ground.',
+        'Hiển thị UI prompt tương tác trong phạm vi 2.5m: "[E] Đẩy cửa phòng VIP" / "[E] Đóng cửa phòng VIP".',
+        'Hỗ trợ âm thanh mở/đóng cửa và xoay mượt mà với Quaternion.Lerp (góc mở 90 độ).',
+      ],
+    },
     property_purchasing: {
       fileName: 'PropertyPurchasingManager.cs',
       path: 'Assets/Scripts/RealEstate/PropertyPurchasingManager.cs',
@@ -235,6 +267,30 @@ export const ScriptViewer: React.FC<ScriptViewerProps> = ({ config }) => {
       {/* Script Selector Tabs */}
       <div className="space-y-3">
         <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-xl">
+          <button
+            onClick={() => setActiveTab('hardware_placement')}
+            className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all ${
+              activeTab === 'hardware_placement'
+                ? 'bg-cyan-600 text-white shadow-sm ring-1 ring-cyan-400'
+                : 'text-cyan-300 hover:text-cyan-200'
+            }`}
+          >
+            <Hammer className="w-4 h-4 text-cyan-300" />
+            <span>★ Shop &amp; Đặt Đồ 5-Tier: HardwareShopAndPlacementSystem.cs</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('vip_door')}
+            className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all ${
+              activeTab === 'vip_door'
+                ? 'bg-amber-600 text-white shadow-sm ring-1 ring-amber-400'
+                : 'text-amber-300 hover:text-amber-200'
+            }`}
+          >
+            <DoorOpen className="w-4 h-4 text-amber-300" />
+            <span>★ Cửa Phòng VIP (Hinge & NavMesh): VipDoorController.cs</span>
+          </button>
+
           <button
             onClick={() => setActiveTab('property_purchasing')}
             className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-all ${

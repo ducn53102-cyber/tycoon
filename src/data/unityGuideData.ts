@@ -273,4 +273,9 @@ export const troubleshootingList = [
     cause: 'Customer.cs chưa gọi hàm FindBestAvailableComputer() hoặc GetTotalScore().',
     solution: 'Đảm bảo Customer.cs sử dụng logic chấm điểm GetTotalScore() trong phiên bản code mới nhất.',
   },
+  {
+    issue: 'Người chơi hoặc NPC bị kẹt cứng, không thể bước vào phòng VIP dù cửa đã mở',
+    cause: 'BoxCollider cánh cửa không xoay theo Hinge Pivot hoặc không chuyển isTrigger = true khi mở; hoặc collider vách ngăn đè lên khe cửa; hoặc sàn phòng VIP chưa nướng NavMesh.',
+    solution: '1. Gắn BoxCollider làm con của Hinge Pivot và đặt doorCollider.isTrigger = true khi mở (giải phóng hoàn toàn physical volume). 2. Đảm bảo khe cửa mở rộng 1.6m và dời bàn ghế/kệ đồ ăn cách xa ngưỡng cửa tối thiểu 1.2m. 3. Đảm bảo sàn phòng VIP được tích Navigation Static và Bake NavMesh đầy đủ; tắt NavMeshObstacle khi mở cửa.',
+  },
 ];

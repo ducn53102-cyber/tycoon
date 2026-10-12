@@ -24,7 +24,21 @@ import {
   Eye,
   Camera,
   Building2,
+  ShoppingBag,
+  Package,
+  Hammer,
 } from 'lucide-react';
+import {
+  HardwareItemDefinition,
+  InventoryBackpackItem,
+  PlacedFurnitureItem,
+  HARDWARE_CATALOG,
+  DESK_SNAP_SLOTS,
+  DeskSlotName,
+  HardwareCategory,
+} from '../data/hardwareCatalog';
+import { HardwareShopModal } from './HardwareShopModal';
+import { BackpackModal } from './BackpackModal';
 
 export interface StationUpgradeState {
   id: number;
@@ -49,6 +63,13 @@ export interface StationUpgradeState {
   screenOnMat?: THREE.Material;
   screenOffMat?: THREE.Material;
   screenWingMeshes?: THREE.Mesh[];
+  // Chair & Seating Transform Data (NPC Customer Alignment)
+  attachedChairInstanceId?: string;
+  chairPosition?: THREE.Vector3;
+  chairHeight?: number;
+  chairRotationY?: number;
+  deskFacingRotationY?: number;
+  parentDeskId?: string;
 }
 
 export interface FingerJointGroup {
@@ -116,6 +137,7 @@ export interface CustomerSimEntity {
   state: 'walking' | 'playing' | 'waiting' | 'leaving';
   mesh?: THREE.Group;
   bodyLimbs?: CustomerBodyLimbs;
+  isTrigger?: boolean;
   mixer?: THREE.AnimationMixer;
   actions?: {
     idle?: THREE.AnimationAction;
@@ -145,14 +167,19 @@ export interface CustomerSimEntity {
   foodRequestTimer?: number;
   orderedItemName?: string;
   foodOrderPrice?: number;
+  exitWaypoint?: number;
+  exitDirection?: number;
 }
 
 export type ActiveInteractionType =
   | { type: 'fridge'; text: string; subText?: string }
   | { type: 'serve'; customerId: number; stationId: number; stationName: string; text: string; subText?: string }
   | { type: 'needs_food_hint'; customerId: number; stationId: number; stationName: string; text: string; subText?: string }
-  | { type: 'station_upgrade'; stationId: number; distance: number; text: string }
+  | { type: 'station_upgrade'; stationId: number; distance: number; text: string; subText?: string }
   | { type: 'property_purchase'; propertyId: string; propertyName: string; price: number; text: string; subText?: string }
+  | { type: 'vip_door'; text: string; subText?: string }
+  | { type: 'hardware_store'; text: string; subText?: string }
+  | { type: 'pickup_furniture'; instanceId: string; itemName: string; text: string; subText?: string }
   | null;
 
 export interface ConsoleLogEntry {
@@ -205,8 +232,131 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
   // F&B Food & Beverage Delivery System States
   const [isCarryingFood, setIsCarryingFood] = useState<boolean>(false);
   const isCarryingFoodRef = useRef<boolean>(false);
+  // PC Hardware Store Carry & Deliver Upgrade System
+  const [isCarryingPCBox, setIsCarryingPCBox] = useState<boolean>(false);
+  const isCarryingPCBoxRef = useRef<boolean>(false);
+  const carryingPCBoxMeshRef = useRef<THREE.Group | null>(null);
+  const carsListRef = useRef<{ mesh: THREE.Group; speed: number; laneZ: number }[]>([]);
+  const lastCarHitTimeRef = useRef<number>(0);
   const [activeInteraction, setActiveInteraction] = useState<ActiveInteractionType>(null);
   const activeInteractionRef = useRef<ActiveInteractionType>(null);
+
+  // Hardware Shop, Backpack Inventory & Free-Form Build Mode States (Internet Cafe Simulator)
+  const [isHardwareShopOpen, setIsHardwareShopOpen] = useState<boolean>(false);
+  const [isBackpackOpen, setIsBackpackOpen] = useState<boolean>(false);
+  const [backpack, setBackpack] = useState<InventoryBackpackItem[]>(() => [
+    // Pre-populate with initial starter equipment so the player can test Build Mode immediately
+    {
+      instanceId: 'starter_desk_01',
+      itemDefId: 'desk_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'desk_t2')!,
+      acquiredAt: Date.now() - 10000,
+    },
+    {
+      instanceId: 'starter_chair_01',
+      itemDefId: 'chair_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'chair_t2')!,
+      acquiredAt: Date.now() - 9000,
+    },
+    {
+      instanceId: 'starter_mon_01',
+      itemDefId: 'mon_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'mon_t2')!,
+      acquiredAt: Date.now() - 8000,
+    },
+    {
+      instanceId: 'starter_pc_01',
+      itemDefId: 'pc_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'pc_t2')!,
+      acquiredAt: Date.now() - 7000,
+    },
+    {
+      instanceId: 'starter_kb_01',
+      itemDefId: 'kb_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'kb_t2')!,
+      acquiredAt: Date.now() - 6000,
+    },
+    {
+      instanceId: 'starter_mouse_01',
+      itemDefId: 'mouse_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'mouse_t2')!,
+      acquiredAt: Date.now() - 5000,
+    },
+    {
+      instanceId: 'starter_headset_01',
+      itemDefId: 'hs_t2',
+      item: HARDWARE_CATALOG.find(i => i.id === 'hs_t2')!,
+      acquiredAt: Date.now() - 4000,
+    },
+  ]);
+  const backpackRef = useRef<InventoryBackpackItem[]>(backpack);
+  backpackRef.current = backpack;
+
+  // Build Mode Active Item & Hologram Refs
+  const [buildModeItem, setBuildModeItem] = useState<InventoryBackpackItem | null>(null);
+  const buildModeItemRef = useRef<InventoryBackpackItem | null>(null);
+  buildModeItemRef.current = buildModeItem;
+
+  const ghostMeshRef = useRef<THREE.Group | null>(null);
+  const isGhostValidRef = useRef<boolean>(true);
+  const ghostMaterialsRef = useRef<{ green: THREE.MeshBasicMaterial; red: THREE.MeshBasicMaterial } | null>(null);
+  const ghostRotationYRef = useRef<number>(0); // Scroll wheel rotation angle (radians)
+
+  // Active snapped desk slot reference
+  const activeSnappedSlotRef = useRef<{
+    deskId: string;
+    slotName: DeskSlotName;
+    worldPos: THREE.Vector3;
+    worldRotY: number;
+  } | null>(null);
+
+  // Active targeted placed furniture for [F] Raycast pickup
+  const activePickupFurnitureRef = useRef<{ instanceId: string; itemName: string } | null>(null);
+
+  // Placed Furniture Meshes & Desks Registry (For Auto-Snap Slots and Complete PC Set Check)
+  const placedFurnitureRef = useRef<PlacedFurnitureItem[]>([]);
+  const placedFurnitureGroupsRef = useRef<Map<string, THREE.Group>>(new Map());
+  const placedFurnitureCollidersRef = useRef<Map<string, THREE.Box3>>(new Map());
+  const placedDesksRegistryRef = useRef<Map<string, {
+    deskId: string;
+    group: THREE.Group;
+    deskItem: HardwareItemDefinition;
+    center: THREE.Vector3;
+    rotationY: number;
+    topY: number;
+    box: THREE.Box3;
+    size: THREE.Vector3;
+    isReadyForCustomer: boolean;
+    slots: {
+      Monitor: PlacedFurnitureItem | null;
+      Keyboard: PlacedFurnitureItem | null;
+      Mouse: PlacedFurnitureItem | null;
+      PCCase: PlacedFurnitureItem | null;
+      Headset: PlacedFurnitureItem | null;
+      Chair: PlacedFurnitureItem | null;
+    };
+    holograms: {
+      Monitor?: THREE.Group;
+      Keyboard?: THREE.Group;
+      Mouse?: THREE.Group;
+      PCCase?: THREE.Group;
+      Headset?: THREE.Group;
+      Chair?: THREE.Group;
+    };
+    checkmarkMesh?: THREE.Group;
+    checkmarkTimeoutId?: any;
+    stationId?: number;
+  }>>(new Map());
+  const placedDesksBoundsRef = useRef<{
+    id: string;
+    box: THREE.Box3;
+    topY: number;
+    center: THREE.Vector3;
+    size: THREE.Vector3;
+  }[]>([]);
+  const [isVipDoorOpen, setIsVipDoorOpen] = useState<boolean>(false);
+  const isVipDoorOpenRef = useRef<boolean>(false);
+  const vipDoorHingeRef = useRef<THREE.Group | null>(null);
   const [floatingPopups, setFloatingPopups] = useState<FloatingPopup[]>([]);
   const [selectedUpgradeStation, setSelectedUpgradeStation] = useState<StationUpgradeState | null>(null);
   const [inspectCustomer, setInspectCustomer] = useState<CustomerSimEntity | null>(null);
@@ -1602,6 +1752,96 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     }
   };
 
+  // Helper to query desk for transform data of attached chair, ensuring exact NPC navigation destination & rotation
+  const updateStationChairTransform = (station: StationUpgradeState) => {
+    // 1. Check if station belongs to a custom placed desk
+    let deskRecord: any = null;
+    for (const d of placedDesksRegistryRef.current.values()) {
+      if (
+        (station.parentDeskId && d.deskId === station.parentDeskId) ||
+        (station.id && d.stationId === station.id) ||
+        (station.stationGroup && d.group === station.stationGroup)
+      ) {
+        deskRecord = d;
+        break;
+      }
+    }
+
+    if (deskRecord) {
+      // Action - Update NPC Target: Query the desk for the transform data of the ATTACHED CHAIR
+      let chairPos: THREE.Vector3 | null = null;
+      let chairRotY: number = deskRecord.rotationY;
+
+      // Check slot Chair
+      if (deskRecord.slots.Chair) {
+        const chairMesh = placedFurnitureGroupsRef.current.get(deskRecord.slots.Chair.instanceId);
+        if (chairMesh) {
+          chairPos = chairMesh.position.clone();
+          chairRotY = chairMesh.rotation.y;
+        } else if (deskRecord.slots.Chair.position) {
+          const [cx, cy, cz] = deskRecord.slots.Chair.position;
+          chairPos = new THREE.Vector3(cx, cy, cz);
+          chairRotY = deskRecord.slots.Chair.rotationY;
+        }
+      }
+
+      // If not in slot, search for closest placed Chair within 2.2m of the desk
+      if (!chairPos) {
+        let closestDist = 2.2;
+        for (const item of placedFurnitureRef.current) {
+          if (item.category === 'Chair') {
+            const cMesh = placedFurnitureGroupsRef.current.get(item.instanceId);
+            const pos = cMesh ? cMesh.position : new THREE.Vector3(...item.position);
+            const d = pos.distanceTo(deskRecord.center);
+            if (d < closestDist) {
+              closestDist = d;
+              chairPos = pos.clone();
+              chairRotY = cMesh ? cMesh.rotation.y : item.rotationY;
+              // Link attached chair to desk
+              deskRecord.slots.Chair = item;
+            }
+          }
+        }
+      }
+
+      // Fallback if still no chair placed (e.g. initial setup)
+      if (!chairPos) {
+        const sin = Math.sin(deskRecord.rotationY);
+        const cos = Math.cos(deskRecord.rotationY);
+        chairPos = new THREE.Vector3(
+          deskRecord.center.x + sin * 0.65,
+          0,
+          deskRecord.center.z + cos * 0.65
+        );
+      }
+
+      // NPC's final navigation destination must be the exact position of the Chair, NOT the desk center!
+      station.sitPoint = new THREE.Vector3(chairPos.x, 0, chairPos.z);
+      station.chairPosition = chairPos.clone();
+      station.chairHeight = chairPos.y + 0.48; // Cushion height (e.g. chair.position.y + 0.5)
+
+      // Query Monitor position or desk forward vector so NPC faces the screen
+      let screenLookPos = deskRecord.center.clone();
+      if (deskRecord.slots.Monitor) {
+        const monMesh = placedFurnitureGroupsRef.current.get(deskRecord.slots.Monitor.instanceId);
+        if (monMesh) {
+          screenLookPos.copy(monMesh.position);
+        }
+      }
+      // Force NPC rotation to face screen (vector from chair towards monitor)
+      const dirX = screenLookPos.x - chairPos.x;
+      const dirZ = screenLookPos.z - chairPos.z;
+      station.deskFacingRotationY = Math.atan2(dirX, dirZ);
+    } else {
+      // Starter station (IDs 1-6)
+      const chairPos = new THREE.Vector3(station.position.x, 0, station.position.z + 0.65);
+      station.chairPosition = chairPos;
+      station.sitPoint = chairPos.clone();
+      station.chairHeight = 0.48;
+      station.deskFacingRotationY = Math.PI; // Screen is at -Z, facing -Z is Math.PI
+    }
+  };
+
   // Spawn customer logic
   const spawnCustomer = useCallback(() => {
     if (!sceneRef.current) return;
@@ -1647,6 +1887,10 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
     } else {
       targetPC = stationsRef.current.find(st => !st.isOccupied) || null;
+    }
+
+    if (targetPC) {
+      updateStationChairTransform(targetPC);
     }
 
     const initSat = calculateSatisfactionCore(
@@ -1762,20 +2006,27 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     syncToParent();
   };
 
-  // Upgrade handler
+  // Upgrade handler (Requires isCarryingPCBox == true)
   const handleUpgrade = (component: 'monitor' | 'gpu' | 'ram') => {
     if (!selectedUpgradeStation) return;
     const st = stationsRef.current.find(s => s.id === selectedUpgradeStation.id);
     if (!st) return;
 
+    if (!isCarryingPCBoxRef.current) {
+      addLog('Không thể nâng cấp! Cần qua đường đến Cửa Hàng PC Hardware mua hộp linh kiện trước.', 'error');
+      triggerPopup('Cần mua linh kiện ở shop đối diện! 📦', playerPosRef.current, '#ef4444');
+      soundController.playPowerSwitch(false);
+      return;
+    }
+
     let currentLvl = 1;
-    let cost = 0;
 
     if (component === 'monitor') {
       currentLvl = st.monitorLevel;
-      if (currentLvl >= 5) return;
-      cost = upgradePrices.monitor[currentLvl];
-      if (totalMoney < cost) return;
+      if (currentLvl >= 5) {
+        addLog('Màn hình đã đạt cấp tối đa (MAX)!', 'info');
+        return;
+      }
       st.monitorLevel++;
       if (st.monitorFrameMesh) {
         const scaleX = 1.0 + (st.monitorLevel - 1) * 0.18;
@@ -1787,9 +2038,10 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
     } else if (component === 'gpu') {
       currentLvl = st.gpuLevel;
-      if (currentLvl >= 5) return;
-      cost = upgradePrices.gpu[currentLvl];
-      if (totalMoney < cost) return;
+      if (currentLvl >= 5) {
+        addLog('Card đồ họa đã đạt cấp tối đa (MAX)!', 'info');
+        return;
+      }
       st.gpuLevel++;
       if (st.pcCaseLedMesh) {
         const ledMat = st.pcCaseLedMesh.material as THREE.MeshStandardMaterial;
@@ -1801,17 +2053,17 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
     } else if (component === 'ram') {
       currentLvl = st.ramLevel;
-      if (currentLvl >= 5) return;
-      cost = upgradePrices.ram[currentLvl];
-      if (totalMoney < cost) return;
+      if (currentLvl >= 5) {
+        addLog('RAM đã đạt cấp tối đa (MAX)!', 'info');
+        return;
+      }
       st.ramLevel++;
     }
 
-    setTotalMoney(m => m - cost);
     soundController.playPowerSwitch(true);
 
     const qualityPoints = st.ramLevel * 2 + st.gpuLevel * 3 + st.monitorLevel * 2;
-    triggerPopup(`Nâng cấp! Chất lượng máy: +${qualityPoints}đ`, st.position, '#38bdf8');
+    triggerPopup(`Nâng cấp! Chất lượng máy: +${qualityPoints}đ 🎉`, st.position, '#38bdf8');
     addLog(`Đã nâng cấp ${component.toUpperCase()} cho ${st.name}! Điểm máy: +${qualityPoints}đ`);
 
     const currentCust = customersRef.current.find(c => c.targetStationId === st.id);
@@ -1828,6 +2080,9 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       triggerPopup(`Hài lòng tăng: ${sat.emoji} ${sat.finalScore}đ`, st.position, '#10b981');
     }
 
+    isCarryingPCBoxRef.current = false;
+    setIsCarryingPCBox(false);
+    addLog('Nâng cấp máy tính thành công!', 'success');
     setSelectedUpgradeStation({ ...st });
     syncToParent();
   };
@@ -1878,9 +2133,94 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         soundController.playCashChime();
         syncToParent();
       }
+    } else if (currentInteraction.type === 'pickup_furniture') {
+      handlePickupFurniture(currentInteraction.instanceId);
+    } else if (currentInteraction.type === 'hardware_store') {
+      // 2. Hardware Store UI & Backpack System:
+      // Shop UI: When the player presses [E] at the Hardware store counter, open a 2D Shop Menu
+      setIsHardwareShopOpen(true);
+      soundController.playCashChime();
+      addLog('Đã mở Cửa Hàng PC HARDWARE & UPGRADES (7 Danh Mục x 5 Tiers).', 'info');
     } else if (currentInteraction.type === 'station_upgrade') {
       const st = stationsRef.current.find(s => s.id === currentInteraction.stationId);
-      if (st) setSelectedUpgradeStation({ ...st });
+      if (!st) return;
+
+      if (!isCarryingPCBoxRef.current) {
+        addLog('Không thể nâng cấp! Cần qua đường đến Cửa Hàng PC Hardware mua hộp linh kiện trước.', 'error');
+        triggerPopup('Cần mua linh kiện ở shop đối diện! 📦', playerPosRef.current, '#ef4444');
+        soundController.playPowerSwitch(false);
+        return;
+      }
+
+      // Player approaches PC desk with isCarryingPCBox == true and presses [E] to upgrade it!
+      let compToUpgrade: 'gpu' | 'monitor' | 'ram' = 'gpu';
+      if (st.gpuLevel <= st.monitorLevel && st.gpuLevel <= st.ramLevel && st.gpuLevel < 5) {
+        compToUpgrade = 'gpu';
+      } else if (st.monitorLevel <= st.ramLevel && st.monitorLevel < 5) {
+        compToUpgrade = 'monitor';
+      } else if (st.ramLevel < 5) {
+        compToUpgrade = 'ram';
+      } else if (st.gpuLevel < 5) {
+        compToUpgrade = 'gpu';
+      } else if (st.monitorLevel < 5) {
+        compToUpgrade = 'monitor';
+      }
+
+      if (st.gpuLevel >= 5 && st.monitorLevel >= 5 && st.ramLevel >= 5) {
+        addLog(`${st.name} đã đạt cấu hình tối đa (MAX) cho tất cả linh kiện!`, 'info');
+        triggerPopup(`${st.name} đã MAX cấu hình! ⭐`, st.position, '#f59e0b');
+        return;
+      }
+
+      if (compToUpgrade === 'gpu') {
+        st.gpuLevel++;
+        if (st.pcCaseLedMesh) {
+          const ledMat = st.pcCaseLedMesh.material as THREE.MeshStandardMaterial;
+          if (ledMat) {
+            const colors = [0x06b6d4, 0x3b82f6, 0xa855f7, 0xec4899, 0xf59e0b];
+            ledMat.emissive = new THREE.Color(colors[st.gpuLevel - 1]);
+            ledMat.emissiveIntensity = 2.5;
+          }
+        }
+      } else if (compToUpgrade === 'monitor') {
+        st.monitorLevel++;
+        if (st.monitorFrameMesh) {
+          const scaleX = 1.0 + (st.monitorLevel - 1) * 0.18;
+          st.monitorFrameMesh.scale.set(scaleX, 1, 1);
+        }
+        if (st.screenMesh) {
+          const scaleX = 1.0 + (st.monitorLevel - 1) * 0.18;
+          st.screenMesh.scale.set(scaleX, 1, 1);
+        }
+      } else {
+        st.ramLevel++;
+      }
+
+      soundController.playPowerSwitch(true);
+
+      const qualityPoints = st.ramLevel * 2 + st.gpuLevel * 3 + st.monitorLevel * 2;
+      triggerPopup(`Nâng cấp! Chất lượng máy: +${qualityPoints}đ 🎉`, st.position, '#38bdf8');
+      addLog(`Đã nâng cấp ${compToUpgrade.toUpperCase()} cho ${st.name}! Điểm máy: +${qualityPoints}đ`);
+
+      const currentCust = customersRef.current.find(c => c.targetStationId === st.id);
+      if (currentCust) {
+        const sat = calculateSatisfactionCore(
+          st,
+          currentCust.waitTimeSeconds,
+          internetPlanRef.current,
+          acEnabledRef.current,
+          foodServiceRef.current,
+          pricingPolicyRef.current
+        );
+        Object.assign(currentCust, sat);
+        triggerPopup(`Hài lòng tăng: ${sat.emoji} ${sat.finalScore}đ`, st.position, '#10b981');
+      }
+
+      isCarryingPCBoxRef.current = false;
+      setIsCarryingPCBox(false);
+      addLog('Nâng cấp máy tính thành công!', 'success');
+      triggerPopup('Nâng cấp máy tính thành công! 🚀', playerPosRef.current, '#10b981');
+      syncToParent();
     } else if (currentInteraction.type === 'property_purchase') {
       const prop = propertiesRef.current.find(p => p.id === currentInteraction.propertyId);
       if (!prop || prop.isPurchased) return;
@@ -1926,6 +2266,26 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         soundController.playCashChime();
         syncToParent();
       }
+    } else if (currentInteraction.type === 'vip_door') {
+      const nextOpen = !isVipDoorOpenRef.current;
+      isVipDoorOpenRef.current = nextOpen;
+      setIsVipDoorOpen(nextOpen);
+      soundController.playPowerSwitch(nextOpen);
+      if (nextOpen) {
+        addLog('🚪 [VIP ZONE] Đã đẩy mở cửa phòng VIP (10 PCs Đấu Giải).', 'success');
+        triggerPopup('🚪 Đã mở cửa VIP ZONE!', playerPosRef.current, '#f59e0b');
+      } else {
+        addLog('🚪 [VIP ZONE] Đã đóng cửa phòng VIP.');
+        triggerPopup('🚪 Đã đóng cửa phòng VIP', playerPosRef.current, '#94a3b8');
+      }
+      const updatedInteraction: ActiveInteractionType = {
+        type: 'vip_door',
+        text: nextOpen ? `[${configRef.current.interactKey}] Đóng cửa phòng VIP` : `[${configRef.current.interactKey}] Đẩy cửa phòng VIP`,
+        subText: 'Phòng VIP Cyber Gaming • 10 Máy Đấu Giải Đỉnh Cao',
+      };
+      activeInteractionRef.current = updatedInteraction;
+      setActiveInteraction(updatedInteraction);
+      syncToParent();
     }
   };
 
@@ -1971,6 +2331,37 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     carryingTrayGroup.visible = false;
     carryingTrayMeshRef.current = carryingTrayGroup;
     camera.add(carryingTrayGroup);
+
+    // First-Person PC Hardware Parts Box (attached to camera for visual carry & deliver feedback)
+    const carryingPCBoxGroup = new THREE.Group();
+    const pcBoxBody = new THREE.Mesh(
+      new THREE.BoxGeometry(0.38, 0.26, 0.28),
+      new THREE.MeshStandardMaterial({ color: 0xb58957, roughness: 0.85, metalness: 0.05 })
+    );
+    carryingPCBoxGroup.add(pcBoxBody);
+
+    // Box brown packing tape
+    const pcBoxTape = new THREE.Mesh(
+      new THREE.BoxGeometry(0.385, 0.035, 0.285),
+      new THREE.MeshStandardMaterial({ color: 0x85582a, roughness: 0.7 })
+    );
+    pcBoxTape.position.set(0, 0.125, 0);
+    carryingPCBoxGroup.add(pcBoxTape);
+
+    // Neon graphics card brand label sticker
+    const pcBoxSticker = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.24, 0.15),
+      new THREE.MeshBasicMaterial({ color: 0x10b981 })
+    );
+    pcBoxSticker.position.set(0, 0.02, 0.142);
+    carryingPCBoxGroup.add(pcBoxSticker);
+
+    carryingPCBoxGroup.position.set(0.18, -0.24, -0.42);
+    carryingPCBoxGroup.rotation.set(0.12, -0.15, 0.08);
+    carryingPCBoxGroup.visible = false;
+    carryingPCBoxMeshRef.current = carryingPCBoxGroup;
+    camera.add(carryingPCBoxGroup);
+
     scene.add(camera);
 
     // Unity HDRP Style Renderer Settings (Optimized for Web Performance & Low Memory)
@@ -2110,7 +2501,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     scene.add(cableCoverR);
 
     // Lateral branch wire covers under desks
-    for (const bz of [-2.8, -0.9, 1.0]) {
+    for (const bz of [-2.4, -0.5, 1.4]) {
       const branchL = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.02, 0.08), cableMat);
       branchL.position.set(-1.75, 0.01, bz);
       scene.add(branchL);
@@ -2244,6 +2635,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       map: acousticWallTex,
       color: 0xffffff,
       roughness: 0.75,
+      side: THREE.DoubleSide,
     });
     const leftWallMesh = new THREE.Mesh(new THREE.PlaneGeometry(16, 4.2), wallAcousticMat);
     leftWallMesh.rotation.y = Math.PI / 2;
@@ -2806,7 +3198,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     createRightPoster('DOTA 2', 'THE INTERNATIONAL', '#a855f7', -4.2);
 
     // --- BACK WALL & SERVICE COUNTER (Quầy Thu Ngân, Kệ Mì Tôm, Tủ Mát Nước Ngọt) ---
-    // 1. Back Wall Structure
+    // 1. Back Wall Structure (Covers main hall from x = -1.0 to x = +4.25; VIP room opens leftward)
     const backWallGroup = new THREE.Group();
     backWallGroup.position.set(0, 1.9, -6.1);
 
@@ -2827,17 +3219,19 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       const tex = new THREE.CanvasTexture(c);
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
-      tex.repeat.set(3, 1.5);
+      tex.repeat.set(2, 1.5);
       return tex;
     };
     const backWallTex = createBackWallTexture();
+    // Back wall for main hall spans width 5.30 centered at x = 1.60 (from x = -1.05 to x = +4.25)
     const backWallMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(8.5, 4.2),
-      new THREE.MeshStandardMaterial({ map: backWallTex, color: 0xffffff, roughness: 0.8 })
+      new THREE.PlaneGeometry(5.30, 4.2),
+      new THREE.MeshStandardMaterial({ map: backWallTex, color: 0xffffff, roughness: 0.8, side: THREE.DoubleSide })
     );
+    backWallMesh.position.set(1.60, 0, 0);
     backWallGroup.add(backWallMesh);
 
-    // Illuminated Neon Center Signboard above Service Counter
+    // Illuminated Neon Center Signboard above Service Counter (centered around x = 1.80)
     const cyberSignCanvas = document.createElement('canvas');
     cyberSignCanvas.width = 768;
     cyberSignCanvas.height = 180;
@@ -2861,7 +3255,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     }
     const cyberSignTex = new THREE.CanvasTexture(cyberSignCanvas);
     const cyberSignMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(3.6, 0.85),
+      new THREE.PlaneGeometry(2.4, 0.82),
       new THREE.MeshBasicMaterial({
         map: cyberSignTex,
         polygonOffset: true,
@@ -2869,31 +3263,32 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         polygonOffsetUnits: -2,
       })
     );
-    cyberSignMesh.position.set(0, 1.25, 0.08);
+    cyberSignMesh.position.set(1.80, 1.25, 0.08);
     backWallGroup.add(cyberSignMesh);
 
     // Cyber sign mesh is self-illuminated via MeshBasicMaterial
     scene.add(backWallGroup);
 
-    // 2. Far End Service Counter (Quầy Thu Ngân)
+    // 2. Far End Service Counter (Quầy Thu Ngân) - Sized neatly in main hall nook, forward along Z
+    // Clear 0.9m+ physical gap between back of checkout counter and beverage fridge
     const counterGroup = new THREE.Group();
-    counterGroup.position.set(0.4, 0, -5.2);
+    counterGroup.position.set(1.8, 0, -3.9);
 
     // Counter Base (Dark walnut front with bevel)
     const counterBaseMat = new THREE.MeshStandardMaterial({ color: 0x3d2b1f, roughness: 0.55 });
-    const counterBase = new THREE.Mesh(new THREE.BoxGeometry(2.8, 1.02, 0.8), counterBaseMat);
+    const counterBase = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.02, 0.8), counterBaseMat);
     counterBase.position.set(0, 0.51, 0);
     counterGroup.add(counterBase);
 
     // Polished Black Quartz Countertop
     const counterTopMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.2, metalness: 0.35 });
-    const counterTop = new THREE.Mesh(new THREE.BoxGeometry(2.9, 0.06, 0.88), counterTopMat);
+    const counterTop = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.06, 0.88), counterTopMat);
     counterTop.position.set(0, 1.04, 0);
     counterGroup.add(counterTop);
 
     // Cyan LED Underglow Strip along bottom of counter
     const counterLed = new THREE.Mesh(
-      new THREE.BoxGeometry(2.78, 0.02, 0.02),
+      new THREE.BoxGeometry(1.78, 0.02, 0.02),
       new THREE.MeshBasicMaterial({ color: 0x00f0ff })
     );
     counterLed.position.set(0, 0.02, 0.41);
@@ -2979,9 +3374,10 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
 
     scene.add(counterGroup);
 
-    // 3. Wooden Snack & Instant Noodle Shelves (Kệ Mì Tôm & Bánh Snack)
+    // 3. Wooden Snack & Instant Noodle Shelves (Kệ Mì Tôm & Bánh Snack) - Mounted along Left Acoustic Wall (Clearing VIP Passageway)
     const snackShelvesGroup = new THREE.Group();
-    snackShelvesGroup.position.set(-2.6, 0, -5.6);
+    snackShelvesGroup.position.set(-3.95, 0, -1.8);
+    snackShelvesGroup.rotation.y = Math.PI / 2;
 
     const shelfWoodMat = new THREE.MeshStandardMaterial({ color: 0x5c4033, roughness: 0.65 });
     const shelfSideL = new THREE.Mesh(new THREE.BoxGeometry(0.05, 2.2, 0.4), shelfWoodMat);
@@ -3031,9 +3427,9 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
     });
 
-    // Stainless Steel Hot Water Dispenser (Bình đun nước sôi pha mì tôm)
+    // Stainless Steel Hot Water Dispenser (Bình đun nước sôi pha mì tôm) - Next to snack shelf along left wall
     const dispenserGroup = new THREE.Group();
-    dispenserGroup.position.set(-1.45, 1.05, -5.2);
+    dispenserGroup.position.set(-3.95, 1.05, -0.6);
     const steelMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, metalness: 0.9, roughness: 0.15 });
     const dispBody = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.42, 16), steelMat);
     dispBody.position.set(0, 0.21, 0);
@@ -3050,9 +3446,603 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     scene.add(dispenserGroup);
     scene.add(snackShelvesGroup);
 
+    // =========================================================================
+    // 3B. CLEAN RECTANGULAR VIP ROOM ARCHITECTURE (10 ULTRA TOURNAMENT PCs)
+    // Strictly Outer-Only Perimeter Walls: Width 5.80m (x in [-5.90, -0.10]), Depth 9.40m (z in [-4.80, -14.20])
+    // Zero internal divider walls, mesh plates, or metallic rails!
+    // Open 2.5m central walking aisle down the middle (x from -4.25 to -1.75)
+    // =========================================================================
+    const vipRoomGroup = new THREE.Group();
+
+    // 1. DoubleSide Dark Acoustic Soundproof Outer Boundary Walls ONLY
+    const vipWallMat = new THREE.MeshStandardMaterial({
+      color: 0x141b26,
+      roughness: 0.65,
+      metalness: 0.15,
+      side: THREE.DoubleSide,
+    });
+
+    // Outer Left Boundary Wall (at x = -5.90, running from z = -4.80 to -14.20, length 9.40m)
+    const vipLeftWall = new THREE.Mesh(new THREE.PlaneGeometry(9.40, 3.8), vipWallMat);
+    vipLeftWall.rotation.y = Math.PI / 2;
+    vipLeftWall.position.set(-5.90, 1.9, -9.50);
+    vipRoomGroup.add(vipLeftWall);
+
+    // Outer Right Boundary Wall (at x = -0.10, running from z = -4.80 to -14.20, length 9.40m)
+    const vipRightWall = new THREE.Mesh(new THREE.PlaneGeometry(9.40, 3.8), vipWallMat);
+    vipRightWall.rotation.y = Math.PI / 2;
+    vipRightWall.position.set(-0.10, 1.9, -9.50);
+    vipRoomGroup.add(vipRightWall);
+
+    // Outer Back Boundary Wall (at z = -14.20, running from x = -5.90 to -0.10, width 5.80m)
+    const vipBackWall = new THREE.Mesh(new THREE.PlaneGeometry(5.80, 3.8), vipWallMat);
+    vipBackWall.position.set(-3.00, 1.9, -14.20);
+    vipRoomGroup.add(vipBackWall);
+
+    // Outer Front Boundary Wall (at z = -4.80, width 5.80m with 1.8m central doorway from x = -3.90 to -2.10)
+    // Left front segment: x from -5.90 to -3.90 (width 2.00, center x = -4.90)
+    const vipFrontLeft = new THREE.Mesh(new THREE.PlaneGeometry(2.00, 3.8), vipWallMat);
+    vipFrontLeft.position.set(-4.90, 1.9, -4.80);
+    vipRoomGroup.add(vipFrontLeft);
+
+    // Right front segment: x from -2.10 to -0.10 (width 2.00, center x = -1.10)
+    const vipFrontRight = new THREE.Mesh(new THREE.PlaneGeometry(2.00, 3.8), vipWallMat);
+    vipFrontRight.position.set(-1.10, 1.9, -4.80);
+    vipRoomGroup.add(vipFrontRight);
+
+    // Front lintel above doorway: x from -3.90 to -2.10 (width 1.80, height 1.30, y from 2.50 to 3.80, center x = -3.00, y = 3.15)
+    const vipFrontLintel = new THREE.Mesh(new THREE.PlaneGeometry(1.80, 1.30), vipWallMat);
+    vipFrontLintel.position.set(-3.00, 3.15, -4.80);
+    vipRoomGroup.add(vipFrontLintel);
+
+    // Dark Titanium Door Jamb Frame around 1.8m wide doorway
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, metalness: 0.92, roughness: 0.18 });
+    const vipDoorFrameTop = new THREE.Mesh(new THREE.BoxGeometry(1.88, 0.08, 0.08), frameMat);
+    vipDoorFrameTop.position.set(-3.00, 2.50, -4.80);
+    vipRoomGroup.add(vipDoorFrameTop);
+
+    const vipDoorFrameL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.5, 0.08), frameMat);
+    vipDoorFrameL.position.set(-3.90, 1.25, -4.80);
+    vipRoomGroup.add(vipDoorFrameL);
+
+    const vipDoorFrameR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.5, 0.08), frameMat);
+    vipDoorFrameR.position.set(-2.10, 1.25, -4.80);
+    vipRoomGroup.add(vipDoorFrameR);
+
+    // Polished Dark VIP Floor with Gold LED Tile Grid (width 5.80m, depth 9.40m)
+    const createVipFloorTexture = () => {
+      const c = document.createElement('canvas');
+      c.width = 512;
+      c.height = 512;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#070b12';
+        ctx.fillRect(0, 0, 512, 512);
+
+        // Gold carbon & dark slate luxury floor tile grid
+        ctx.strokeStyle = '#1e293b';
+        ctx.lineWidth = 3;
+        for (let x = 0; x <= 512; x += 128) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, 512);
+          ctx.stroke();
+        }
+        for (let y = 0; y <= 512; y += 128) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(512, y);
+          ctx.stroke();
+        }
+
+        // Gold accent inlay highlights
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.28)';
+        ctx.lineWidth = 2;
+        for (let x = 128; x <= 384; x += 128) {
+          for (let y = 128; y <= 384; y += 128) {
+            ctx.strokeRect(x - 20, y - 20, 40, 40);
+          }
+        }
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(4, 8);
+      return tex;
+    };
+
+    const vipFloorMat = new THREE.MeshStandardMaterial({
+      map: createVipFloorTexture(),
+      roughness: 0.18,
+      metalness: 0.45,
+    });
+    const vipFloor = new THREE.Mesh(new THREE.PlaneGeometry(5.80, 9.40), vipFloorMat);
+    vipFloor.rotation.x = -Math.PI / 2;
+    vipFloor.position.set(-3.00, 0.012, -9.50);
+    vipRoomGroup.add(vipFloor);
+
+    // VIP Ceiling with acoustic black panels (5.80m x 9.40m)
+    const vipCeiling = new THREE.Mesh(new THREE.PlaneGeometry(5.80, 9.40), vipWallMat);
+    vipCeiling.rotation.x = Math.PI / 2;
+    vipCeiling.position.set(-3.00, 3.80, -9.50);
+    vipRoomGroup.add(vipCeiling);
+
+    // Triple Gold & Cyan Neon Ceiling Strips
+    const vipGoldNeonMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+    const vipCyanNeonMat = new THREE.MeshBasicMaterial({ color: 0x06b6d4 });
+
+    const vipNeonL = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 9.0, 8), vipCyanNeonMat);
+    vipNeonL.rotation.x = Math.PI / 2;
+    vipNeonL.position.set(-4.50, 3.75, -9.50);
+    vipRoomGroup.add(vipNeonL);
+
+    const vipNeonC = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 9.0, 8), vipGoldNeonMat);
+    vipNeonC.rotation.x = Math.PI / 2;
+    vipNeonC.position.set(-3.00, 3.75, -9.50);
+    vipRoomGroup.add(vipNeonC);
+
+    const vipNeonR = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 9.0, 8), vipCyanNeonMat);
+    vipNeonR.rotation.x = Math.PI / 2;
+    vipNeonR.position.set(-1.50, 3.75, -9.50);
+    vipRoomGroup.add(vipNeonR);
+
+    // Glowing Neon Sign: 'VIP ZONE' on Outer Partition Wall (Centered above 1.8m doorway at x = -3.00)
+    const vipSignCanvas = document.createElement('canvas');
+    vipSignCanvas.width = 512;
+    vipSignCanvas.height = 140;
+    const vsCtx = vipSignCanvas.getContext('2d');
+    if (vsCtx) {
+      vsCtx.fillStyle = '#080d16';
+      vsCtx.fillRect(0, 0, 512, 140);
+      vsCtx.strokeStyle = '#f59e0b';
+      vsCtx.lineWidth = 6;
+      vsCtx.strokeRect(6, 6, 500, 128);
+
+      vsCtx.fillStyle = '#fbbf24';
+      vsCtx.font = '900 44px sans-serif';
+      vsCtx.textAlign = 'center';
+      vsCtx.fillText('⚡ VIP ZONE ⚡', 256, 56);
+
+      vsCtx.fillStyle = '#06b6d4';
+      vsCtx.font = 'bold 21px monospace';
+      vsCtx.fillText('ESPORTS TOURNAMENT ARENA • 10 ULTRA PCs', 256, 94);
+
+      vsCtx.fillStyle = '#22c55e';
+      vsCtx.font = 'bold 18px sans-serif';
+      vsCtx.fillText('[E] ĐẨY CỬA PHÒNG VIP', 256, 123);
+    }
+    const vipSignTex = new THREE.CanvasTexture(vipSignCanvas);
+    const vipSignMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.4, 0.62),
+      new THREE.MeshBasicMaterial({ map: vipSignTex, side: THREE.DoubleSide })
+    );
+    vipSignMesh.position.set(-3.00, 3.10, -4.75);
+    vipRoomGroup.add(vipSignMesh);
+
+    // Interactive Pushable Door (Hinge Pivot on left jamb at x = -3.90, z = -4.80)
+    // 1.8m wide doorway: door swings inward smoothly by 90 degrees on [E]
+    const vipDoorPivot = new THREE.Group();
+    vipDoorPivot.position.set(-3.90, 0, -4.80);
+    vipDoorHingeRef.current = vipDoorPivot;
+
+    const vipDoorMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      metalness: 0.88,
+      roughness: 0.22,
+      side: THREE.DoubleSide,
+    });
+    const vipDoorMesh = new THREE.Mesh(new THREE.BoxGeometry(1.80, 2.46, 0.05), vipDoorMat);
+    vipDoorMesh.position.set(0.90, 1.23, 0); // Offset by half width (+0.90)
+    vipDoorPivot.add(vipDoorMesh);
+
+    // Tempered tinted gold glass panel in door
+    const vipGlassMat = new THREE.MeshStandardMaterial({
+      color: 0xf59e0b,
+      transparent: true,
+      opacity: 0.38,
+      depthWrite: false,
+      roughness: 0.08,
+      metalness: 0.2,
+      side: THREE.DoubleSide,
+    });
+    const vipDoorGlass = new THREE.Mesh(new THREE.PlaneGeometry(1.48, 1.7), vipGlassMat);
+    vipDoorGlass.position.set(0.90, 1.28, 0.03);
+    vipDoorPivot.add(vipDoorGlass);
+
+    // Gold vertical tubular push handles
+    const vipHandleMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.95, roughness: 0.1 });
+    const vipHandle = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.72, 8), vipHandleMat);
+    vipHandle.position.set(1.66, 1.18, 0.04);
+    vipDoorPivot.add(vipHandle);
+
+    const vipHandleIn = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.72, 8), vipHandleMat);
+    vipHandleIn.position.set(1.66, 1.18, -0.04);
+    vipDoorPivot.add(vipHandleIn);
+
+    scene.add(vipDoorPivot);
+
+    // Large Tournament Championship Billboard on VIP Back Wall (z = -14.15)
+    const vipBackBannerCanvas = document.createElement('canvas');
+    vipBackBannerCanvas.width = 1024;
+    vipBackBannerCanvas.height = 320;
+    const vbbCtx = vipBackBannerCanvas.getContext('2d');
+    if (vbbCtx) {
+      vbbCtx.fillStyle = '#060a12';
+      vbbCtx.fillRect(0, 0, 1024, 320);
+      vbbCtx.strokeStyle = '#f59e0b';
+      vbbCtx.lineWidth = 8;
+      vbbCtx.strokeRect(12, 12, 1000, 296);
+
+      vbbCtx.fillStyle = '#f59e0b';
+      vbbCtx.font = 'bold 52px sans-serif';
+      vbbCtx.textAlign = 'center';
+      vbbCtx.fillText('⚡ ROG TOURNAMENT ARENA ⚡', 512, 95);
+
+      vbbCtx.fillStyle = '#06b6d4';
+      vbbCtx.font = 'bold 36px monospace';
+      vbbCtx.fillText('VIETNAM NATIONAL ESPORTS CHAMPIONSHIP', 512, 170);
+
+      vbbCtx.fillStyle = '#10b981';
+      vbbCtx.font = 'bold 30px monospace';
+      vbbCtx.fillText('10 BATTLESTATIONS • 360Hz TOURNAMENT RIGS • FIBER 10Gbps', 512, 245);
+    }
+    const vipBackBannerTex = new THREE.CanvasTexture(vipBackBannerCanvas);
+    const vipBackBanner = new THREE.Mesh(
+      new THREE.PlaneGeometry(4.6, 1.25),
+      new THREE.MeshBasicMaterial({ map: vipBackBannerTex, side: THREE.DoubleSide })
+    );
+    vipBackBanner.position.set(-3.00, 1.50, -14.15);
+    vipRoomGroup.add(vipBackBanner);
+
+    // 2. SINGLE WALL-MOUNTED AIR CONDITIONER (BoxGeometry) HIGH UP AT y = 2.5 ON BACK WALL
+    // Obstacle-free open air mesh vent, digital temperature display, and faint blue/green indicator light
+    const vipAcGroup = new THREE.Group();
+    vipAcGroup.position.set(-3.00, 2.50, -14.05);
+
+    // Main AC rectangular body (BoxGeometry)
+    const acBodyMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.28, metalness: 0.08 });
+    const acBody = new THREE.Mesh(new THREE.BoxGeometry(1.50, 0.42, 0.28), acBodyMat);
+    vipAcGroup.add(acBody);
+
+    // Open obstacle-free air intake grille on top
+    const acGrilleMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.45 });
+    const acGrille = new THREE.Mesh(new THREE.BoxGeometry(1.36, 0.02, 0.22), acGrilleMat);
+    acGrille.position.set(0, 0.21, 0);
+    vipAcGroup.add(acGrille);
+
+    // Open, obstacle-free air mesh & discharge flap angled downward
+    const acFlapMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.35, side: THREE.DoubleSide });
+    const acFlap = new THREE.Mesh(new THREE.PlaneGeometry(1.38, 0.16), acFlapMat);
+    acFlap.position.set(0, -0.16, 0.15);
+    acFlap.rotation.x = 0.45;
+    vipAcGroup.add(acFlap);
+
+    // Faint blue/green indicator light (Cyan/Green LED)
+    const vipAcLedMat = new THREE.MeshBasicMaterial({ color: 0x06b6d4 });
+    const acIndicatorLight = new THREE.Mesh(new THREE.SphereGeometry(0.022, 12, 12), vipAcLedMat);
+    acIndicatorLight.position.set(0.60, -0.10, 0.145);
+    vipAcGroup.add(acIndicatorLight);
+
+    // Subtle faint cyan glow around indicator
+    const acPointLight = new THREE.PointLight(0x06b6d4, 0.45, 2.0);
+    acPointLight.position.set(0.60, -0.10, 0.22);
+    vipAcGroup.add(acPointLight);
+
+    // Digital temperature LED display (16°C Inverter Turbo)
+    const acDisplayCanvas = document.createElement('canvas');
+    acDisplayCanvas.width = 128;
+    acDisplayCanvas.height = 64;
+    const adCtx = acDisplayCanvas.getContext('2d');
+    if (adCtx) {
+      adCtx.fillStyle = '#0f172a';
+      adCtx.fillRect(0, 0, 128, 64);
+      adCtx.fillStyle = '#22c55e';
+      adCtx.font = 'bold 36px monospace';
+      adCtx.textAlign = 'center';
+      adCtx.fillText('16°C', 64, 46);
+    }
+    const acDisplayTex = new THREE.CanvasTexture(adCtx ? acDisplayCanvas : document.createElement('canvas'));
+    const acDisplayMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.24, 0.12), new THREE.MeshBasicMaterial({ map: acDisplayTex }));
+    acDisplayMesh.position.set(0.38, 0.02, 0.145);
+    vipAcGroup.add(acDisplayMesh);
+
+    vipRoomGroup.add(vipAcGroup);
+
+    // =========================================================================
+    // 5. 12 HIGH-END VIP GAMING PC SETUPS & SOLID LUXURY GAMING CHAIRS
+    // 2 Spacious Rows of 6 Battlestations facing the 1.4m central tournament aisle:
+    // Left Row (6 PCs): x_desk = -4.50, facing +X (towards center aisle)
+    // Right Row (6 PCs): x_desk = -1.60, facing -X (towards center aisle)
+    // Walkable entrance foyer inside door: z in [-4.80, -6.20] (1.4m clear vestibule)
+    // Z positions: [-6.6, -7.9, -9.2, -10.5, -11.8, -13.1] (1.3m pitch between stations)
+    // Every desk has an instantiated Luxury Gold & Black Gaming Chair at floor height (y=0)
+    // =========================================================================
+
+    // Shared Materials for High-End VIP Battlestations & Chairs
+    const createCarbonFiberDeskTexture = () => {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#111620';
+        ctx.fillRect(0, 0, 256, 256);
+        ctx.fillStyle = '#1c2433';
+        for (let x = 0; x < 256; x += 16) {
+          for (let y = 0; y < 256; y += 16) {
+            if ((x / 16 + y / 16) % 2 === 0) {
+              ctx.fillRect(x, y, 16, 16);
+            }
+          }
+        }
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.4)';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(4, 4, 248, 248);
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(2, 2);
+      return tex;
+    };
+
+    const vipDeskTopMat = new THREE.MeshStandardMaterial({
+      map: createCarbonFiberDeskTexture(),
+      roughness: 0.28,
+      metalness: 0.4,
+    });
+    const vipDeskLegMat = new THREE.MeshStandardMaterial({ color: 0x090d16, metalness: 0.9, roughness: 0.2 });
+    const vipMousePadMat = new THREE.MeshStandardMaterial({ color: 0x0b1320, roughness: 0.7 });
+    const vipKbdMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.35 });
+    const vipMonFrameMat = new THREE.MeshStandardMaterial({ color: 0x070b12, metalness: 0.92, roughness: 0.15 });
+    const vipMonStandMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.85, roughness: 0.25 });
+    const vipScreenMatCyan = new THREE.MeshBasicMaterial({ color: 0x06b6d4 });
+    const vipScreenMatGold = new THREE.MeshBasicMaterial({ color: 0xfbbf24 });
+    const vipPcCaseMat = new THREE.MeshStandardMaterial({ color: 0x0a0f18, metalness: 0.92, roughness: 0.18 });
+    const vipPcGlassMat = new THREE.MeshStandardMaterial({
+      color: 0xbae6fd,
+      transparent: true,
+      opacity: 0.35,
+      roughness: 0.1,
+      metalness: 0.3,
+      depthWrite: false,
+    });
+    const vipFanCyanMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff });
+    const vipFanGoldMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+
+    // Premium Gold & Black Gaming Chair Materials
+    const chairBlackLeatherMat = new THREE.MeshStandardMaterial({ color: 0x0a0f18, roughness: 0.4, metalness: 0.2 });
+    const chairGoldLeatherMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.25, metalness: 0.65 });
+    const chairMetalMat = new THREE.MeshStandardMaterial({ color: 0x090d16, metalness: 0.9, roughness: 0.2 });
+    const chairChromePistonMat = new THREE.MeshStandardMaterial({ color: 0xd1d5db, metalness: 0.95, roughness: 0.1 });
+
+    const createVipGamingChair = (chairX: number, chairZ: number, isLeft: boolean) => {
+      const chairGroup = new THREE.Group();
+      chairGroup.position.set(chairX, 0, chairZ);
+      // Left row chair faces desk at left (-X): rotY = Math.PI / 2 (90 degrees)
+      // Right row chair faces desk at right (+X): rotY = -Math.PI / 2 (-90 degrees)
+      chairGroup.rotation.y = isLeft ? Math.PI / 2 : -Math.PI / 2;
+
+      // 1. 5-Star Spider Base & Caster Wheels at Floor
+      const baseHub = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.05, 12), chairMetalMat);
+      baseHub.position.set(0, 0.06, 0);
+      chairGroup.add(baseHub);
+
+      for (let w = 0; w < 5; w++) {
+        const angle = (w * Math.PI * 2) / 5;
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.025, 0.04), chairMetalMat);
+        leg.position.set(Math.cos(angle) * 0.13, 0.055, Math.sin(angle) * 0.13);
+        leg.rotation.y = -angle;
+        chairGroup.add(leg);
+
+        const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.03, 8), chairMetalMat);
+        wheel.rotation.x = Math.PI / 2;
+        wheel.position.set(Math.cos(angle) * 0.24, 0.025, Math.sin(angle) * 0.24);
+        chairGroup.add(wheel);
+      }
+
+      // 2. Heavy Chrome Hydraulic Gas-Lift Piston
+      const piston = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.32, 12), chairChromePistonMat);
+      piston.position.set(0, 0.22, 0);
+      chairGroup.add(piston);
+
+      // 3. Contoured Luxury Seat Cushion (Black Center + Gold Racing Bolsters)
+      const seatCushion = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.09, 0.44), chairBlackLeatherMat);
+      seatCushion.position.set(0, 0.44, 0);
+      chairGroup.add(seatCushion);
+
+      // Gold racing side wings on seat
+      const seatWingL = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.11, 0.44), chairGoldLeatherMat);
+      seatWingL.position.set(-0.21, 0.47, 0);
+      seatWingL.rotation.z = -0.18;
+      chairGroup.add(seatWingL);
+
+      const seatWingR = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.11, 0.44), chairGoldLeatherMat);
+      seatWingR.position.set(0.21, 0.47, 0);
+      seatWingR.rotation.z = 0.18;
+      chairGroup.add(seatWingR);
+
+      // 4. Ergonomic High Backrest with Gold Racing Wings
+      const backrestGroup = new THREE.Group();
+      backrestGroup.position.set(0, 0.48, 0.19);
+      backrestGroup.rotation.x = 0.06;
+
+      const backrestCenter = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.72, 0.07), chairBlackLeatherMat);
+      backrestCenter.position.set(0, 0.36, 0);
+      backrestGroup.add(backrestCenter);
+
+      // Gold shoulder & spine racing bolster wings
+      const backWingL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.66, 0.07), chairGoldLeatherMat);
+      backWingL.position.set(-0.21, 0.34, 0.02);
+      backWingL.rotation.y = -0.25;
+      backrestGroup.add(backWingL);
+
+      const backWingR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.66, 0.07), chairGoldLeatherMat);
+      backWingR.position.set(0.21, 0.34, 0.02);
+      backWingR.rotation.y = 0.25;
+      backrestGroup.add(backWingR);
+
+      // Gold Neck Pillow / Headrest with VIP embroidery
+      const neckPillow = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.13, 0.07), chairGoldLeatherMat);
+      neckPillow.position.set(0, 0.65, 0.04);
+      backrestGroup.add(neckPillow);
+
+      // Gold Lumbar Support Cushion
+      const lumbarPillow = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.15, 0.06), chairGoldLeatherMat);
+      lumbarPillow.position.set(0, 0.14, 0.04);
+      backrestGroup.add(lumbarPillow);
+
+      chairGroup.add(backrestGroup);
+
+      // 5. 3D Adjustable Armrests with Gold Accent Caps
+      [-0.25, 0.25].forEach(armX => {
+        const armPole = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.24, 0.04), chairMetalMat);
+        armPole.position.set(armX, 0.54, 0);
+        chairGroup.add(armPole);
+
+        const armPad = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.03, 0.22), chairBlackLeatherMat);
+        armPad.position.set(armX, 0.66, -0.02);
+        chairGroup.add(armPad);
+
+        const armGoldCap = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.008, 0.06), chairGoldLeatherMat);
+        armGoldCap.position.set(armX, 0.675, -0.02);
+        chairGroup.add(armGoldCap);
+      });
+
+      return chairGroup;
+    };
+
+    // Exactly 5 Setups per side (10 VIP PCs in total) spaced 1.5m apart
+    const vipZPositions = [-6.50, -8.00, -9.50, -11.00, -12.50];
+
+    for (let i = 0; i < 10; i++) {
+      const isLeft = i < 5;
+      const slot = i % 5;
+      const zPos = vipZPositions[slot];
+      const deskX = isLeft ? -5.40 : -0.60;
+      const facingSign = isLeft ? 1 : -1; // Direction towards central aisle
+
+      const stGroup = new THREE.Group();
+
+      // 1. Grounded Carbon-Fiber Battlestation Desk (Grounded flush at y = 0)
+      const deskMesh = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.055, 0.95), vipDeskTopMat);
+      deskMesh.position.set(deskX, 0.745, zPos);
+      stGroup.add(deskMesh);
+
+      // Heavy steel pedestal legs grounded at y = 0 (height 0.72, center 0.36)
+      const legMesh = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.72, 0.82), vipDeskLegMat);
+      legMesh.position.set(deskX, 0.36, zPos);
+      stGroup.add(legMesh);
+
+      // Extended esports speed mousepad on desk surface
+      const mousePad = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.008, 0.75), vipMousePadMat);
+      mousePad.position.set(deskX + facingSign * 0.12, 0.776, zPos);
+      stGroup.add(mousePad);
+
+      // RGB Mechanical Keyboard & Esports Mouse
+      const kbd = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.02, 0.44), vipKbdMat);
+      kbd.position.set(deskX + facingSign * 0.08, 0.786, zPos);
+      stGroup.add(kbd);
+
+      const mouse = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.024, 0.06), vipDeskLegMat);
+      mouse.position.set(deskX + facingSign * 0.08, 0.786, zPos + 0.28);
+      stGroup.add(mouse);
+
+      // 2. High-End Curved Ultrawide Monitor (21:9 Curved Display)
+      // Rotated to face the chair and central aisle directly
+      const monX = isLeft ? -5.48 : -0.52;
+      const monRotY = isLeft ? Math.PI / 2 : -Math.PI / 2;
+
+      const monGroup = new THREE.Group();
+      monGroup.position.set(monX, 1.15, zPos);
+      monGroup.rotation.y = monRotY;
+
+      // Heavy metal monitor stand & arm grounded on desk surface
+      const standBase = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.02, 0.20), vipMonStandMat);
+      standBase.position.set(0, -0.37, 0);
+      monGroup.add(standBase);
+
+      const standPole = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.38, 0.04), vipMonStandMat);
+      standPole.position.set(0, -0.19, -0.06);
+      monGroup.add(standPole);
+
+      // Curved Ultrawide Bezel Frame (Center + Angled Wings)
+      const frameCenter = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.38, 0.03), vipMonFrameMat);
+      monGroup.add(frameCenter);
+
+      const frameWingL = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.38, 0.03), vipMonFrameMat);
+      frameWingL.position.set(-0.35, 0, 0.04);
+      frameWingL.rotation.y = 0.28;
+      monGroup.add(frameWingL);
+
+      const frameWingR = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.38, 0.03), vipMonFrameMat);
+      frameWingR.position.set(0.35, 0, 0.04);
+      frameWingR.rotation.y = -0.28;
+      monGroup.add(frameWingR);
+
+      // Emissive High-Refresh Curved Screen (Alternating Glowing Cyan and Gold)
+      const screenMat = i % 2 === 0 ? vipScreenMatCyan : vipScreenMatGold;
+      const screenCenter = new THREE.Mesh(new THREE.PlaneGeometry(0.50, 0.35), screenMat);
+      screenCenter.position.set(0, 0, 0.018);
+      monGroup.add(screenCenter);
+
+      const screenWingL = new THREE.Mesh(new THREE.PlaneGeometry(0.23, 0.35), screenMat);
+      screenWingL.position.set(-0.35, 0, 0.056);
+      screenWingL.rotation.y = 0.28;
+      monGroup.add(screenWingL);
+
+      const screenWingR = new THREE.Mesh(new THREE.PlaneGeometry(0.23, 0.35), screenMat);
+      screenWingR.position.set(0.35, 0, 0.056);
+      screenWingR.rotation.y = -0.28;
+      monGroup.add(screenWingR);
+
+      stGroup.add(monGroup);
+
+      // 3. Custom VIP Gaming PC Case with Transparent Glass & Glowing RGB Fans
+      const pcX = isLeft ? -5.46 : -0.54;
+      const pcZ = zPos + 0.32;
+      const pcGroup = new THREE.Group();
+      pcGroup.position.set(pcX, 1.01, pcZ);
+      pcGroup.rotation.y = monRotY;
+
+      // Dark aluminum chassis
+      const pcBody = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.48, 0.22), vipPcCaseMat);
+      pcGroup.add(pcBody);
+
+      // Tempered transparent glass panel facing the user
+      const pcGlass = new THREE.Mesh(new THREE.PlaneGeometry(0.42, 0.44), vipPcGlassMat);
+      pcGlass.position.set(0, 0, 0.115);
+      pcGroup.add(pcGlass);
+
+      // Glowing RGB Cooling Fans inside the case (Cyan & Gold)
+      const fan1 = new THREE.Mesh(new THREE.TorusGeometry(0.065, 0.016, 8, 16), vipFanCyanMat);
+      fan1.position.set(-0.08, 0.10, 0.05);
+      pcGroup.add(fan1);
+
+      const fan2 = new THREE.Mesh(new THREE.TorusGeometry(0.065, 0.016, 8, 16), vipFanGoldMat);
+      fan2.position.set(-0.08, -0.10, 0.05);
+      pcGroup.add(fan2);
+
+      stGroup.add(pcGroup);
+
+      vipRoomGroup.add(stGroup);
+
+      // 4. INSTANTIATE PREMIUM BLACK & GOLD GAMING CHAIR
+      // Offset 0.9m from desk into the central aisle:
+      // Left row chair: x = -4.50 (rotated 90 deg / Math.PI / 2 to face desk)
+      // Right row chair: x = -1.50 (rotated -90 deg / -Math.PI / 2 to face desk)
+      // Grounded flush at y = 0
+      const chairX = isLeft ? -4.50 : -1.50;
+      const chair = createVipGamingChair(chairX, zPos, isLeft);
+      vipRoomGroup.add(chair);
+    }
+
+    scene.add(vipRoomGroup);
+
     // 4. Brightly Lit Glass-Door Beverage Refrigerator (Tủ Mát Nước Ngọt & Đồ Ăn)
+    // Placed neatly against back wall at x = 3.2, z = -5.6, with a clear 0.9m+ physical gap to the checkout counter
     const coolerGroup = new THREE.Group();
-    coolerGroup.position.set(2.8, 0, -5.5);
+    coolerGroup.position.set(3.2, 0, -5.6);
 
     // Refrigerator Outer Shell (Hollow Open Cabinet so interior is 100% visible)
     const coolerShellMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.7, roughness: 0.3 });
@@ -3259,7 +4249,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
 
     // A. Cyber Cafe Open Entrance Wall (z = 5.05)
     // Left front wall segment (x from -4.25 to -1.15)
-    const frontWallMat = new THREE.MeshStandardMaterial({ color: 0x222a38, roughness: 0.82 });
+    const frontWallMat = new THREE.MeshStandardMaterial({ color: 0x222a38, roughness: 0.82, side: THREE.DoubleSide });
     const frontWallLeft = new THREE.Mesh(new THREE.PlaneGeometry(3.1, 4.2), frontWallMat);
     frontWallLeft.position.set(-2.7, 1.9, 5.05);
     frontWallLeft.rotation.y = Math.PI;
@@ -3450,10 +4440,90 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     farSidewalk.position.set(0, 0.01, 27.0);
     scene.add(farSidewalk);
 
-    // Distant urban city buildings / cyberpunk skyline silhouette
+    // Procedural Low-Poly Animated Vehicles on Road (Continuous Moving Traffic System)
+    carsListRef.current = [];
+    const createLowPolyCar = (posX: number, posZ: number, rotY: number, bodyColor: number, speed: number) => {
+      const carGroup = new THREE.Group();
+      carGroup.position.set(posX, 0.22, posZ);
+      carGroup.rotation.y = rotY;
+
+      // 1. Car body chassis (BoxGeometry)
+      const carMat = new THREE.MeshStandardMaterial({ color: bodyColor, metalness: 0.4, roughness: 0.35 });
+      const carBody = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.65, 1.7), carMat);
+      carBody.position.set(0, 0.25, 0);
+      carGroup.add(carBody);
+
+      // 2. Smaller BoxGeometry for cabin & windows
+      const cabinMat = new THREE.MeshStandardMaterial({ color: 0x090d16, roughness: 0.15, metalness: 0.8 });
+      const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.58, 1.45), cabinMat);
+      cabin.position.set(-0.2, 0.78, 0);
+      carGroup.add(cabin);
+
+      // Windshield glass plane
+      const winMat = new THREE.MeshStandardMaterial({ color: 0x93c5fd, roughness: 0.1, metalness: 0.5 });
+      const windshield = new THREE.Mesh(new THREE.PlaneGeometry(1.35, 0.48), winMat);
+      windshield.position.set(0.76, 0.78, 0);
+      windshield.rotation.y = Math.PI / 2;
+      windshield.rotation.z = -0.32;
+      carGroup.add(windshield);
+
+      // 3. 4 CylinderGeometry Wheels
+      const wheelGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.22, 12);
+      const wheelMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85 });
+      const wheelOffsets = [
+        { x: 1.1, z: 0.85 },
+        { x: 1.1, z: -0.85 },
+        { x: -1.1, z: 0.85 },
+        { x: -1.1, z: -0.85 },
+      ];
+      wheelOffsets.forEach(wo => {
+        const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+        wheel.rotation.x = Math.PI / 2;
+        wheel.position.set(wo.x, 0.08, wo.z);
+        carGroup.add(wheel);
+      });
+
+      // 4. Headlights & Taillights
+      const headLedMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
+      const tailLedMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+      const hlL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.25), headLedMat);
+      hlL.position.set(1.81, 0.26, 0.55);
+      carGroup.add(hlL);
+
+      const hlR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.25), headLedMat);
+      hlR.position.set(1.81, 0.26, -0.55);
+      carGroup.add(hlR);
+
+      const tlL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.25), tailLedMat);
+      tlL.position.set(-1.81, 0.32, 0.55);
+      carGroup.add(tlL);
+
+      const tlR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.25), tailLedMat);
+      tlR.position.set(-1.81, 0.32, -0.55);
+      carGroup.add(tlR);
+
+      scene.add(carGroup);
+      carsListRef.current.push({ mesh: carGroup, speed, laneZ: posZ });
+      return carGroup;
+    };
+
+    // Continuous Traffic Fleet across 2 Lanes:
+    // Lane 1 (near side, z = 14.8, heading right rotY = 0, speed > 0):
+    createLowPolyCar(-35.0, 14.8, 0, 0xef4444, 14.0); // Red sedan
+    createLowPolyCar(-12.0, 14.8, 0, 0xf8fafc, 13.0); // White SUV
+    createLowPolyCar(12.0, 14.8, 0, 0xeab308, 15.0);  // Yellow Taxi
+    createLowPolyCar(34.0, 14.8, 0, 0xf97316, 14.5);  // Orange sports coupe
+
+    // Lane 2 (far side, z = 21.2, heading left rotY = Math.PI, speed < 0):
+    createLowPolyCar(38.0, 21.2, Math.PI, 0x2563eb, -15.0);  // Blue sedan
+    createLowPolyCar(15.0, 21.2, Math.PI, 0x06b6d4, -14.0);  // Cyan compact
+    createLowPolyCar(-10.0, 21.2, Math.PI, 0xa855f7, -15.5); // Purple coupe
+    createLowPolyCar(-32.0, 21.2, Math.PI, 0x10b981, -13.5); // Green hatchback
+
+    // Distant urban city buildings / cyberpunk skyline silhouette (excluding center bx = 0)
     const buildMatDark = new THREE.MeshStandardMaterial({ color: 0x090d16, roughness: 0.9 });
     const winMatLite = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
-    [-18, -9, 0, 9, 18].forEach((bx, idx) => {
+    [-18, -9, 9, 18].forEach((bx, idx) => {
       const bHeight = 12 + ((idx * 3) % 8);
       const bWidth = 7.5;
       const bDepth = 6.0;
@@ -3467,6 +4537,279 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       winFace.rotation.y = Math.PI;
       scene.add(winFace);
     });
+
+    // =========================================================================
+    // 2. PC HARDWARE & UPGRADES STORE (Across the Street, centered at x = 0, z in [28.8, 35.2])
+    // =========================================================================
+    const hwStoreGroup = new THREE.Group();
+
+    // Store Floor (High-tech dark tiled flooring)
+    const hwFloorMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.35,
+      metalness: 0.3,
+    });
+    const hwFloor = new THREE.Mesh(new THREE.PlaneGeometry(8.2, 6.4), hwFloorMat);
+    hwFloor.rotation.x = -Math.PI / 2;
+    hwFloor.position.set(0, 0.02, 32.0);
+    hwStoreGroup.add(hwFloor);
+
+    // Store Walls Material
+    const hwWallMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.7, metalness: 0.2 });
+    const hwAccentMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.8 });
+
+    // Left Wall
+    const hwLeftWall = new THREE.Mesh(new THREE.BoxGeometry(0.3, 4.6, 6.4), hwWallMat);
+    hwLeftWall.position.set(-4.0, 2.3, 32.0);
+    hwStoreGroup.add(hwLeftWall);
+
+    // Right Wall
+    const hwRightWall = new THREE.Mesh(new THREE.BoxGeometry(0.3, 4.6, 6.4), hwWallMat);
+    hwRightWall.position.set(4.0, 2.3, 32.0);
+    hwStoreGroup.add(hwRightWall);
+
+    // Back Wall
+    const hwBackWall = new THREE.Mesh(new THREE.BoxGeometry(8.3, 4.6, 0.3), hwWallMat);
+    hwBackWall.position.set(0, 2.3, 35.2);
+    hwStoreGroup.add(hwBackWall);
+
+    // Ceiling / Roof
+    const hwCeiling = new THREE.Mesh(new THREE.BoxGeometry(8.3, 0.3, 6.4), hwAccentMat);
+    hwCeiling.position.set(0, 4.6, 32.0);
+    hwStoreGroup.add(hwCeiling);
+
+    // Front Facade (Wide Open Entrance between x = -2.0 and +2.0)
+    // Left front wall
+    const hwFrontLeft = new THREE.Mesh(new THREE.BoxGeometry(1.9, 4.6, 0.3), hwWallMat);
+    hwFrontLeft.position.set(-2.95, 2.3, 28.8);
+    hwStoreGroup.add(hwFrontLeft);
+
+    // Right front wall
+    const hwFrontRight = new THREE.Mesh(new THREE.BoxGeometry(1.9, 4.6, 0.3), hwWallMat);
+    hwFrontRight.position.set(2.95, 2.3, 28.8);
+    hwStoreGroup.add(hwFrontRight);
+
+    // Header beam above open doorway (height 3.2m clearance)
+    const hwHeader = new THREE.Mesh(new THREE.BoxGeometry(4.2, 1.4, 0.35), hwAccentMat);
+    hwHeader.position.set(0, 3.9, 28.8);
+    hwStoreGroup.add(hwHeader);
+
+    // -------------------------------------------------------------------------
+    // BRIGHT GLOWING NEON SIGN: 'PC HARDWARE & UPGRADES'
+    // -------------------------------------------------------------------------
+    const hwSignCanvas = document.createElement('canvas');
+    hwSignCanvas.width = 1024;
+    hwSignCanvas.height = 256;
+    const hwSignCtx = hwSignCanvas.getContext('2d');
+    if (hwSignCtx) {
+      // Dark tech gradient background
+      const grad = hwSignCtx.createLinearGradient(0, 0, 1024, 0);
+      grad.addColorStop(0, '#020617');
+      grad.addColorStop(0.5, '#0f172a');
+      grad.addColorStop(1, '#020617');
+      hwSignCtx.fillStyle = grad;
+      hwSignCtx.fillRect(0, 0, 1024, 256);
+
+      // Neon glowing border
+      hwSignCtx.strokeStyle = '#06b6d4';
+      hwSignCtx.lineWidth = 8;
+      hwSignCtx.strokeRect(10, 10, 1004, 236);
+
+      // Main glowing title 'PC HARDWARE & UPGRADES'
+      hwSignCtx.shadowColor = '#00f0ff';
+      hwSignCtx.shadowBlur = 26;
+      hwSignCtx.fillStyle = '#38bdf8';
+      hwSignCtx.font = '900 64px system-ui, -apple-system, sans-serif';
+      hwSignCtx.textAlign = 'center';
+      hwSignCtx.textBaseline = 'middle';
+      hwSignCtx.fillText('PC HARDWARE & UPGRADES', 512, 100);
+
+      // Inner text shine
+      hwSignCtx.shadowBlur = 10;
+      hwSignCtx.fillStyle = '#ffffff';
+      hwSignCtx.fillText('PC HARDWARE & UPGRADES', 512, 100);
+
+      // Subtitle
+      hwSignCtx.shadowColor = '#f59e0b';
+      hwSignCtx.shadowBlur = 14;
+      hwSignCtx.fillStyle = '#fbbf24';
+      hwSignCtx.font = '700 28px monospace';
+      hwSignCtx.fillText('RTX 5090 • CORE i9 • DDR5 • THÙNG LINH KIỆN NÂNG CẤP', 512, 185);
+    }
+    const signTexture = new THREE.CanvasTexture(hwSignCanvas);
+    const signBoardMat = new THREE.MeshBasicMaterial({ map: signTexture });
+    const signBoardMesh = new THREE.Mesh(new THREE.PlaneGeometry(6.6, 1.35), signBoardMat);
+    signBoardMesh.position.set(0, 4.3, 28.6);
+    hwStoreGroup.add(signBoardMesh);
+
+    // Glowing Neon Tube Rails (Top & Bottom of sign)
+    const neonCyanMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff });
+    const neonAmberMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+
+    const neonTop = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 6.7, 12), neonCyanMat);
+    neonTop.rotation.z = Math.PI / 2;
+    neonTop.position.set(0, 5.0, 28.58);
+    hwStoreGroup.add(neonTop);
+
+    const neonBottom = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 6.7, 12), neonAmberMat);
+    neonBottom.rotation.z = Math.PI / 2;
+    neonBottom.position.set(0, 3.6, 28.58);
+    hwStoreGroup.add(neonBottom);
+
+    // Store Interior Atmospheric Lighting (Cyan/Warm Fill)
+    const hwStoreLight1 = new THREE.PointLight(0x38bdf8, 1.8, 12);
+    hwStoreLight1.position.set(0, 3.8, 32.0);
+    hwStoreGroup.add(hwStoreLight1);
+
+    const hwStoreLight2 = new THREE.PointLight(0xfef08a, 1.2, 8);
+    hwStoreLight2.position.set(0, 3.2, 30.5);
+    hwStoreGroup.add(hwStoreLight2);
+
+    // -------------------------------------------------------------------------
+    // SHOP COUNTER (At z = 32.5, width 3.2m, height 1.05m)
+    // -------------------------------------------------------------------------
+    const hwCounterGroup = new THREE.Group();
+    hwCounterGroup.position.set(0, 0, 32.5);
+
+    // Main Counter Body
+    const hwCounterBodyMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.5, metalness: 0.5 });
+    const hwCounterBody = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.05, 0.85), hwCounterBodyMat);
+    hwCounterBody.position.set(0, 0.525, 0);
+    hwCounterGroup.add(hwCounterBody);
+
+    // Sleek Countertop
+    const hwCounterTopMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.2, metalness: 0.8 });
+    const hwCounterTop = new THREE.Mesh(new THREE.BoxGeometry(3.3, 0.06, 0.95), hwCounterTopMat);
+    hwCounterTop.position.set(0, 1.06, 0);
+    hwCounterGroup.add(hwCounterTop);
+
+    // Glowing Cyan LED Strip along front face of counter
+    const hwCounterLed = new THREE.Mesh(new THREE.BoxGeometry(3.1, 0.04, 0.04), neonCyanMat);
+    hwCounterLed.position.set(0, 0.95, -0.44);
+    hwCounterGroup.add(hwCounterLed);
+
+    // POS Cash Register / Terminal on counter
+    const posMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4 });
+    const posBase = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.15, 0.35), posMat);
+    posBase.position.set(0.9, 1.15, 0);
+    hwCounterGroup.add(posBase);
+
+    const posScreen = new THREE.Mesh(
+      new THREE.BoxGeometry(0.32, 0.24, 0.03),
+      new THREE.MeshBasicMaterial({ color: 0x06b6d4 })
+    );
+    posScreen.position.set(0.9, 1.32, -0.05);
+    posScreen.rotation.x = -0.25;
+    hwCounterGroup.add(posScreen);
+
+    // Display Box (GPU Graphics Card Box) on counter
+    const gpuDisplayMat = new THREE.MeshStandardMaterial({ color: 0x10b981, roughness: 0.4 }); // Nvidia green
+    const gpuDisplayBox = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.32, 0.18), gpuDisplayMat);
+    gpuDisplayBox.position.set(-0.7, 1.22, 0);
+    gpuDisplayBox.rotation.y = 0.3;
+    hwCounterGroup.add(gpuDisplayBox);
+
+    // Cardboard Parts Box Sample on counter
+    const sampleBoxMat = new THREE.MeshStandardMaterial({ color: 0xc49a6c, roughness: 0.8 });
+    const sampleBox = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.24, 0.3), sampleBoxMat);
+    sampleBox.position.set(-0.05, 1.18, 0.05);
+    hwCounterGroup.add(sampleBox);
+
+    hwStoreGroup.add(hwCounterGroup);
+
+    // Stylized Shopkeeper NPC behind counter
+    const shopkeeperGroup = new THREE.Group();
+    shopkeeperGroup.position.set(0, 0, 33.7);
+
+    // Body / Polo Shirt
+    const skBody = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.24, 0.26, 0.85, 12),
+      new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.7 })
+    );
+    skBody.position.set(0, 1.1, 0);
+    shopkeeperGroup.add(skBody);
+
+    // Head
+    const skHead = new THREE.Mesh(
+      new THREE.SphereGeometry(0.18, 14, 14),
+      new THREE.MeshStandardMaterial({ color: 0xfbcfe8, roughness: 0.5 })
+    );
+    skHead.position.set(0, 1.68, 0);
+    shopkeeperGroup.add(skHead);
+
+    // Cap / Headset
+    const skCap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.2, 0.2, 0.08, 14),
+      new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4 })
+    );
+    skCap.position.set(0, 1.84, 0);
+    shopkeeperGroup.add(skCap);
+
+    hwStoreGroup.add(shopkeeperGroup);
+
+    // -------------------------------------------------------------------------
+    // SHELVES DISPLAYING CARDBOARD BOXES (PC Parts)
+    // -------------------------------------------------------------------------
+    const shelfFrameMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.3 });
+    const shelfBoardMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.6 });
+    const boxCardboardMat = new THREE.MeshStandardMaterial({ color: 0xc49a6c, roughness: 0.85 });
+    const boxGpuMat = new THREE.MeshStandardMaterial({ color: 0x064e3b, roughness: 0.4 }); // Dark green GPU box
+    const boxMotherboardMat = new THREE.MeshStandardMaterial({ color: 0x831843, roughness: 0.4 }); // Dark red MB box
+    const boxCpuMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, roughness: 0.4 }); // Intel blue CPU box
+
+    const createShelfUnit = (shelfX: number, shelfZ: number, rotY: number) => {
+      const shelfGroup = new THREE.Group();
+      shelfGroup.position.set(shelfX, 0, shelfZ);
+      shelfGroup.rotation.y = rotY;
+
+      // Vertical 4 Upright Pillars
+      const pGeo = new THREE.BoxGeometry(0.06, 3.2, 0.06);
+      [
+        { x: -1.4, z: -0.35 },
+        { x: 1.4, z: -0.35 },
+        { x: -1.4, z: 0.35 },
+        { x: 1.4, z: 0.35 },
+      ].forEach(p => {
+        const pillar = new THREE.Mesh(pGeo, shelfFrameMat);
+        pillar.position.set(p.x, 1.6, p.z);
+        shelfGroup.add(pillar);
+      });
+
+      // 4 Tiered Shelves (Planks) at y = 0.5, 1.2, 1.9, 2.6
+      const plankGeo = new THREE.BoxGeometry(2.9, 0.05, 0.75);
+      [0.5, 1.2, 1.9, 2.6].forEach(plankY => {
+        const plank = new THREE.Mesh(plankGeo, shelfBoardMat);
+        plank.position.set(0, plankY, 0);
+        shelfGroup.add(plank);
+
+        // Procedural Cardboard Boxes on each tier (representing PC parts)
+        const boxOffsets = [-1.0, -0.4, 0.2, 0.85];
+        boxOffsets.forEach((bX, bIdx) => {
+          const mat =
+            (plankY > 2.0 && bIdx % 2 === 0) ? boxGpuMat :
+            (plankY > 1.5 && bIdx % 2 === 1) ? boxMotherboardMat :
+            (bIdx === 1) ? boxCpuMat : boxCardboardMat;
+          const bW = 0.42 + (bIdx % 2) * 0.1;
+          const bH = 0.28 + ((bIdx + Math.round(plankY)) % 2) * 0.08;
+          const bD = 0.45;
+          const pBox = new THREE.Mesh(new THREE.BoxGeometry(bW, bH, bD), mat);
+          pBox.position.set(bX, plankY + bH / 2 + 0.025, (bIdx % 2 === 0 ? 0.05 : -0.05));
+          shelfGroup.add(pBox);
+        });
+      });
+
+      return shelfGroup;
+    };
+
+    // Left wall shelves (x = -3.4, z = 32.0, facing center +X)
+    const leftShelves = createShelfUnit(-3.4, 32.0, Math.PI / 2);
+    hwStoreGroup.add(leftShelves);
+
+    // Right wall shelves (x = 3.4, z = 32.0, facing center -X)
+    const rightShelves = createShelfUnit(3.4, 32.0, -Math.PI / 2);
+    hwStoreGroup.add(rightShelves);
+
+    scene.add(hwStoreGroup);
 
     // 3. Streetlights with Street Lamps & PointLights
     const poleMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 });
@@ -3516,7 +4859,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     // C. Adjacent Empty Buildings (Left & Right Storefronts)
     // =======================================================
     // 1. LEFT BUILDING: Mặt Bằng 01 (Storefront A at x in [-12.75, -4.25])
-    const storeMat = new THREE.MeshStandardMaterial({ color: 0x1e2532, roughness: 0.85 });
+    const storeMat = new THREE.MeshStandardMaterial({ color: 0x1e2532, roughness: 0.85, side: THREE.DoubleSide });
     const storeGlassMat = new THREE.MeshPhysicalMaterial({ color: 0x64748b, transparent: true, opacity: 0.4, roughness: 0.1 });
 
     // Left building shell
@@ -4248,47 +5591,78 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     // Left Row: 3 Battlestations (x = -2.2)
     // Right Row: 3 Battlestations (x = +2.2)
     stationsRef.current = [
-      buildStation(1, 'Máy 01', -2.2, -2.8),
-      buildStation(2, 'Máy 02', -2.2, -0.9),
-      buildStation(3, 'Máy 03', -2.2, 1.0),
-      buildStation(4, 'Máy 04', 2.2, -2.8),
-      buildStation(5, 'Máy 05', 2.2, -0.9),
-      buildStation(6, 'Máy 06', 2.2, 1.0),
+      buildStation(1, 'Máy 01', -2.2, -2.4),
+      buildStation(2, 'Máy 02', -2.2, -0.5),
+      buildStation(3, 'Máy 03', -2.2, 1.4),
+      buildStation(4, 'Máy 04', 2.2, -2.4),
+      buildStation(5, 'Máy 05', 2.2, -0.5),
+      buildStation(6, 'Máy 06', 2.2, 1.4),
     ];
 
     // --- OBJECT COLLIDERS & RIGIDBODY HITBOX SYSTEM ---
     // Precise bounding box colliders for walls, service counter, rule board, snack shelves, cooler, stations, and street properties
     const colliders: { name: string; min: THREE.Vector3; max: THREE.Vector3 }[] = [
       // 1. Boundary Walls Cyber Cafe (Corridor x in [-1.1, 1.1] is OPEN for walking outside)
-      { name: 'LeftWall', min: new THREE.Vector3(-5.0, 0, -6.5), max: new THREE.Vector3(-3.85, 4.0, 5.2) },
+      { name: 'LeftWall', min: new THREE.Vector3(-5.0, 0, -4.8), max: new THREE.Vector3(-4.10, 4.0, 5.2) },
       { name: 'RightWall', min: new THREE.Vector3(3.85, 0, -6.5), max: new THREE.Vector3(5.0, 4.0, 5.2) },
       { name: 'RuleBoardBuffer', min: new THREE.Vector3(3.70, 0, 2.05), max: new THREE.Vector3(4.30, 4.0, 4.15) },
-      { name: 'BackWall', min: new THREE.Vector3(-4.5, 0, -6.5), max: new THREE.Vector3(4.5, 4.0, -5.9) },
+      { name: 'BackWall_Main', min: new THREE.Vector3(-1.10, 0, -6.5), max: new THREE.Vector3(4.5, 4.0, -5.9) },
       { name: 'FrontEntranceWall_Left', min: new THREE.Vector3(-4.5, 0, 4.85), max: new THREE.Vector3(-1.1, 4.0, 5.25) },
       { name: 'FrontEntranceWall_Right', min: new THREE.Vector3(1.1, 0, 4.85), max: new THREE.Vector3(4.5, 4.0, 5.25) },
 
-      // 2. Far End Service Area Colliders
-      { name: 'ServiceCounter', min: new THREE.Vector3(-1.15, 0, -5.75), max: new THREE.Vector3(1.95, 1.4, -4.68) },
-      { name: 'SnackShelves', min: new THREE.Vector3(-3.8, 0, -6.0), max: new THREE.Vector3(-1.25, 2.5, -4.85) },
-      { name: 'BeverageCooler', min: new THREE.Vector3(2.05, 0, -6.0), max: new THREE.Vector3(3.75, 2.5, -4.95) },
+      // 1B. REBUILT VIP Room Outer Perimeter & Door Colliders (Width 5.80m, Depth 9.40m)
+      { name: 'VipFrontLeft', min: new THREE.Vector3(-5.95, 0, -4.95), max: new THREE.Vector3(-3.90, 4.0, -4.65) },
+      { name: 'VipFrontRight', min: new THREE.Vector3(-2.10, 0, -4.95), max: new THREE.Vector3(-0.05, 4.0, -4.65) },
+      { name: 'VipDoorCollider', min: new THREE.Vector3(-3.92, 0, -4.95), max: new THREE.Vector3(-2.08, 3.0, -4.65) },
+      { name: 'VipRightWall', min: new THREE.Vector3(-0.15, 0, -14.3), max: new THREE.Vector3(0.05, 4.0, -4.75) },
+      { name: 'VipLeftWall', min: new THREE.Vector3(-5.95, 0, -14.3), max: new THREE.Vector3(-5.75, 4.0, -4.75) },
+      { name: 'VipBackWall', min: new THREE.Vector3(-5.95, 0, -14.35), max: new THREE.Vector3(-0.05, 4.0, -14.05) },
+      // 10 Non-overlapping BoxColliders on Desks & CapsuleColliders on Chairs (5 Left, 5 Right)
+      // Left Row Desks & Chairs (x_desk = -5.40, x_chair = -4.50, spacing 1.5m)
+      { name: 'VipDesk_L_0', min: new THREE.Vector3(-5.85, 0, -7.00), max: new THREE.Vector3(-4.95, 1.6, -6.00) },
+      { name: 'VipChair_L_0', min: new THREE.Vector3(-4.80, 0, -6.85), max: new THREE.Vector3(-4.20, 1.4, -6.15) },
+      { name: 'VipDesk_L_1', min: new THREE.Vector3(-5.85, 0, -8.50), max: new THREE.Vector3(-4.95, 1.6, -7.50) },
+      { name: 'VipChair_L_1', min: new THREE.Vector3(-4.80, 0, -8.35), max: new THREE.Vector3(-4.20, 1.4, -7.65) },
+      { name: 'VipDesk_L_2', min: new THREE.Vector3(-5.85, 0, -10.00), max: new THREE.Vector3(-4.95, 1.6, -9.00) },
+      { name: 'VipChair_L_2', min: new THREE.Vector3(-4.80, 0, -9.85), max: new THREE.Vector3(-4.20, 1.4, -9.15) },
+      { name: 'VipDesk_L_3', min: new THREE.Vector3(-5.85, 0, -11.50), max: new THREE.Vector3(-4.95, 1.6, -10.50) },
+      { name: 'VipChair_L_3', min: new THREE.Vector3(-4.80, 0, -11.35), max: new THREE.Vector3(-4.20, 1.4, -10.65) },
+      { name: 'VipDesk_L_4', min: new THREE.Vector3(-5.85, 0, -13.00), max: new THREE.Vector3(-4.95, 1.6, -12.00) },
+      { name: 'VipChair_L_4', min: new THREE.Vector3(-4.80, 0, -12.85), max: new THREE.Vector3(-4.20, 1.4, -12.15) },
+      // Right Row Desks & Chairs (x_desk = -0.60, x_chair = -1.50, spacing 1.5m)
+      { name: 'VipDesk_R_0', min: new THREE.Vector3(-1.05, 0, -7.00), max: new THREE.Vector3(-0.15, 1.6, -6.00) },
+      { name: 'VipChair_R_0', min: new THREE.Vector3(-1.80, 0, -6.85), max: new THREE.Vector3(-1.20, 1.4, -6.15) },
+      { name: 'VipDesk_R_1', min: new THREE.Vector3(-1.05, 0, -8.50), max: new THREE.Vector3(-0.15, 1.6, -7.50) },
+      { name: 'VipChair_R_1', min: new THREE.Vector3(-1.80, 0, -8.35), max: new THREE.Vector3(-1.20, 1.4, -7.65) },
+      { name: 'VipDesk_R_2', min: new THREE.Vector3(-1.05, 0, -10.00), max: new THREE.Vector3(-0.15, 1.6, -9.00) },
+      { name: 'VipChair_R_2', min: new THREE.Vector3(-1.80, 0, -9.85), max: new THREE.Vector3(-1.20, 1.4, -9.15) },
+      { name: 'VipDesk_R_3', min: new THREE.Vector3(-1.05, 0, -11.50), max: new THREE.Vector3(-0.15, 1.6, -10.50) },
+      { name: 'VipChair_R_3', min: new THREE.Vector3(-1.80, 0, -11.35), max: new THREE.Vector3(-1.20, 1.4, -10.65) },
+      { name: 'VipDesk_R_4', min: new THREE.Vector3(-1.05, 0, -13.00), max: new THREE.Vector3(-0.15, 1.6, -12.00) },
+      { name: 'VipChair_R_4', min: new THREE.Vector3(-1.80, 0, -12.85), max: new THREE.Vector3(-1.20, 1.4, -12.15) },
+
+      // 2. Far End Service Area Colliders (Service Counter forward along Z with 0.9m+ gap to fridge)
+      { name: 'ServiceCounter', min: new THREE.Vector3(0.80, 0, -4.40), max: new THREE.Vector3(2.80, 1.4, -3.40) },
+      { name: 'SnackShelves', min: new THREE.Vector3(-4.18, 0, -2.6), max: new THREE.Vector3(-3.70, 2.5, -1.0) },
+      { name: 'BeverageCooler', min: new THREE.Vector3(2.45, 0, -6.05), max: new THREE.Vector3(3.95, 2.5, -5.15) },
 
       // 3. Waiting Area
       { name: 'WaitingChairs', min: new THREE.Vector3(-3.95, 0, 2.0), max: new THREE.Vector3(-3.15, 1.2, 4.4) },
 
       // 4. Battlestations - Left Row (Máy 01, 02, 03)
-      { name: 'Station01', min: new THREE.Vector3(-3.05, 0, -3.35), max: new THREE.Vector3(-1.35, 1.8, -1.95) },
-      { name: 'Station02', min: new THREE.Vector3(-3.05, 0, -1.45), max: new THREE.Vector3(-1.35, 1.8, -0.05) },
-      { name: 'Station03', min: new THREE.Vector3(-3.05, 0, 0.45), max: new THREE.Vector3(-1.35, 1.8, 1.85) },
+      { name: 'Station01', min: new THREE.Vector3(-3.05, 0, -2.95), max: new THREE.Vector3(-1.35, 1.8, -1.55) },
+      { name: 'Station02', min: new THREE.Vector3(-3.05, 0, -1.05), max: new THREE.Vector3(-1.35, 1.8, 0.35) },
+      { name: 'Station03', min: new THREE.Vector3(-3.05, 0, 0.85), max: new THREE.Vector3(-1.35, 1.8, 2.25) },
 
       // 5. Battlestations - Right Row (Máy 04, 05, 06)
-      { name: 'Station04', min: new THREE.Vector3(1.35, 0, -3.35), max: new THREE.Vector3(3.05, 1.8, -1.95) },
-      { name: 'Station05', min: new THREE.Vector3(1.35, 0, -1.45), max: new THREE.Vector3(3.05, 1.8, -0.05) },
-      { name: 'Station06', min: new THREE.Vector3(1.35, 0, 0.45), max: new THREE.Vector3(3.05, 1.8, 1.85) },
+      { name: 'Station04', min: new THREE.Vector3(1.35, 0, -2.95), max: new THREE.Vector3(3.05, 1.8, -1.55) },
+      { name: 'Station05', min: new THREE.Vector3(1.35, 0, -1.05), max: new THREE.Vector3(3.05, 1.8, 0.35) },
+      { name: 'Station06', min: new THREE.Vector3(1.35, 0, 0.85), max: new THREE.Vector3(3.05, 1.8, 2.25) },
 
       // 6. Property 01 (Left Storefront) Locked Door & Walls
       { name: 'DoorCollider_Property01', min: new THREE.Vector3(-8.8, 0, 4.85), max: new THREE.Vector3(-6.2, 4.0, 5.35) },
       { name: 'Wall_Property01_OuterLeft', min: new THREE.Vector3(-13.5, 0, -6.5), max: new THREE.Vector3(-12.5, 4.0, 5.5) },
-      { name: 'Wall_Property01_Back', min: new THREE.Vector3(-13.5, 0, -6.5), max: new THREE.Vector3(-3.8, 4.0, -5.7) },
+      { name: 'Wall_Property01_Back', min: new THREE.Vector3(-13.5, 0, -6.5), max: new THREE.Vector3(-4.18, 4.0, -5.7) },
       { name: 'Wall_Property01_FrontLeft', min: new THREE.Vector3(-13.5, 0, 4.85), max: new THREE.Vector3(-8.8, 4.0, 5.25) },
       { name: 'Wall_Property01_FrontRight', min: new THREE.Vector3(-6.2, 0, 4.85), max: new THREE.Vector3(-3.8, 4.0, 5.25) },
 
@@ -4299,10 +5673,19 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       { name: 'Wall_Property02_FrontLeft', min: new THREE.Vector3(3.8, 0, 4.85), max: new THREE.Vector3(6.2, 4.0, 5.25) },
       { name: 'Wall_Property02_FrontRight', min: new THREE.Vector3(8.8, 0, 4.85), max: new THREE.Vector3(13.5, 4.0, 5.25) },
 
-      // 8. Exterior Street Boundaries
-      { name: 'StreetFarWall', min: new THREE.Vector3(-25.0, 0, 24.0), max: new THREE.Vector3(25.0, 4.0, 26.5) },
-      { name: 'StreetLeftWall', min: new THREE.Vector3(-22.0, 0, 4.8), max: new THREE.Vector3(-18.5, 4.0, 25.5) },
-      { name: 'StreetRightWall', min: new THREE.Vector3(18.5, 0, 4.8), max: new THREE.Vector3(22.0, 4.0, 25.5) },
+      // 8. Exterior Street Boundaries & Hardware Store (Allows crossing road and entering Hardware Store)
+      { name: 'StreetLeftWall', min: new THREE.Vector3(-22.0, 0, 4.8), max: new THREE.Vector3(-18.5, 4.0, 35.5) },
+      { name: 'StreetRightWall', min: new THREE.Vector3(18.5, 0, 4.8), max: new THREE.Vector3(22.0, 4.0, 35.5) },
+      { name: 'FarSidewalkLeftBuilding', min: new THREE.Vector3(-25.0, 0, 28.5), max: new THREE.Vector3(-4.0, 5.0, 35.5) },
+      { name: 'FarSidewalkRightBuilding', min: new THREE.Vector3(4.0, 0, 28.5), max: new THREE.Vector3(25.0, 5.0, 35.5) },
+
+      // PC Hardware Store Interior Colliders
+      { name: 'HardwareStore_LeftWall', min: new THREE.Vector3(-4.2, 0, 28.5), max: new THREE.Vector3(-3.8, 5.0, 35.5) },
+      { name: 'HardwareStore_RightWall', min: new THREE.Vector3(3.8, 0, 28.5), max: new THREE.Vector3(4.2, 5.0, 35.5) },
+      { name: 'HardwareStore_BackWall', min: new THREE.Vector3(-4.2, 0, 34.9), max: new THREE.Vector3(4.2, 5.0, 35.5) },
+      { name: 'HardwareStore_Counter', min: new THREE.Vector3(-1.7, 0, 32.1), max: new THREE.Vector3(1.7, 1.4, 33.2) },
+      { name: 'HardwareStore_LeftShelves', min: new THREE.Vector3(-3.9, 0, 30.5), max: new THREE.Vector3(-2.8, 3.0, 34.2) },
+      { name: 'HardwareStore_RightShelves', min: new THREE.Vector3(2.8, 0, 30.5), max: new THREE.Vector3(3.9, 3.0, 34.2) },
     ];
 
     collidersRef.current = colliders;
@@ -4316,6 +5699,11 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
 
       for (let iter = 0; iter < 3; iter++) {
         for (const col of collidersRef.current) {
+          // If VIP door is opened, player can pass through smoothly!
+          if (col.name === 'VipDoorCollider' && isVipDoorOpenRef.current) {
+            continue;
+          }
+
           const closestX = Math.max(col.min.x, Math.min(x, col.max.x));
           const closestZ = Math.max(col.min.z, Math.min(z, col.max.z));
 
@@ -4346,8 +5734,11 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
 
       // World safety bounds
-      x = Math.max(-16.0, Math.min(16.0, x));
-      z = Math.max(-5.8, Math.min(23.5, z));
+      x = Math.max(-17.0, Math.min(17.0, x));
+      const minZ = (x >= -5.85 && x <= -0.15) ? -14.1 : -5.8;
+      // Allow player to cross street (z up to 28.2) and enter Hardware Store (x in [-3.8, 3.8], z up to 34.5)
+      const maxZ = (x >= -3.8 && x <= 3.8) ? 34.5 : 28.2;
+      z = Math.max(minZ, Math.min(maxZ, z));
 
       return new THREE.Vector3(x, currentPos.y, z);
     };
@@ -4420,6 +5811,7 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
 
           const freePC = stationsRef.current.find(s => !s.isOccupied);
           if (freePC) {
+            updateStationChairTransform(freePC);
             freePC.isOccupied = true;
             freePC.currentCustomerId = waitingCust.id;
             waitingCust.targetStationId = freePC.id;
@@ -4454,32 +5846,63 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         animateCustomerLimbs(cust, delta, cust.state);
 
         if (cust.state === 'leaving' && cust.mesh) {
-          const exitDoor = new THREE.Vector3(0, 0, 4.8);
-          const dir = exitDoor.clone().sub(cust.mesh.position);
-          const distToExit = dir.length();
+          if (cust.exitWaypoint === undefined) {
+            cust.exitWaypoint = 1;
+            cust.exitDirection = Math.random() > 0.5 ? 1 : -1;
+          }
 
-          if (distToExit > 0.35 && cust.mesh.position.z < 4.7) {
-            dir.normalize();
-            cust.mesh.position.add(dir.multiplyScalar(delta * 2.2));
-            cust.mesh.lookAt(exitDoor.x, cust.mesh.position.y, exitDoor.z);
-          } else {
-            // Khách đã bước qua cửa ra ngoài tiệm net!
-            if (sceneRef.current && cust.mesh) {
-              sceneRef.current.remove(cust.mesh);
+          if (cust.exitWaypoint === 1) {
+            // Waypoint 1: Walk to Front Door (0, 0, 4.8)
+            const exitDoor = new THREE.Vector3(0, 0, 4.8);
+            const dir = exitDoor.clone().sub(cust.mesh.position);
+            if (dir.length() > 0.35 && cust.mesh.position.z < 4.65) {
+              dir.normalize();
+              cust.mesh.position.add(dir.multiplyScalar(delta * 2.2));
+              cust.mesh.lookAt(exitDoor.x, cust.mesh.position.y, exitDoor.z);
+            } else {
+              cust.exitWaypoint = 2; // Step onto outer sidewalk
             }
-            customersRef.current = customersRef.current.filter(c => c.id !== cust.id);
-            syncToParent();
+          } else if (cust.exitWaypoint === 2) {
+            // Waypoint 2: Walk out onto Sidewalk (0, 0, 7.5)
+            const sidewalkPoint = new THREE.Vector3(0, 0, 7.5);
+            const dir = sidewalkPoint.clone().sub(cust.mesh.position);
+            if (dir.length() > 0.35) {
+              dir.normalize();
+              cust.mesh.position.add(dir.multiplyScalar(delta * 2.2));
+              cust.mesh.lookAt(sidewalkPoint.x, cust.mesh.position.y, sidewalkPoint.z);
+            } else {
+              cust.exitWaypoint = 3; // Choose direction (Far Left or Far Right down street)
+            }
+          } else {
+            // Waypoint 3: Randomly walk down the street (left or right along sidewalk)
+            const targetX = (cust.exitDirection || 1) * 26.0;
+            const streetPoint = new THREE.Vector3(targetX, 0, 7.5);
+            const dir = streetPoint.clone().sub(cust.mesh.position);
+            dir.normalize();
+            cust.mesh.position.add(dir.multiplyScalar(delta * 2.0));
+            cust.mesh.lookAt(streetPoint.x, cust.mesh.position.y, streetPoint.z);
+
+            // Only destroy() NPC after reaching end of street, out of player's view
+            if (Math.abs(cust.mesh.position.x) > 21.0) {
+              if (sceneRef.current && cust.mesh) {
+                sceneRef.current.remove(cust.mesh);
+              }
+              customersRef.current = customersRef.current.filter(c => c.id !== cust.id);
+              syncToParent();
+            }
           }
         }
 
         if (cust.state === 'walking' && cust.targetStationId) {
           const st = stationsRef.current.find(s => s.id === cust.targetStationId);
           if (st && cust.mesh) {
-            const target = st.sitPoint;
+            updateStationChairTransform(st);
+            const target = st.sitPoint; // Exact ground navigation destination of attached chair
             const dir = target.clone().sub(cust.mesh.position);
+            dir.y = 0;
             const dist = dir.length();
 
-            if (dist > 0.1) {
+            if (dist > 0.12) {
               dir.normalize();
               cust.mesh.position.add(dir.multiplyScalar(delta * 2.2));
               cust.mesh.lookAt(target.x, cust.mesh.position.y, target.z);
@@ -4490,8 +5913,25 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
               cust.orderedItemName = 'Nước/Mì (+15k)';
               cust.foodOrderPrice = 15000;
               cust.mesh.visible = true;
-              cust.mesh.position.set(st.position.x, 0, st.position.z + 0.65);
-              cust.mesh.rotation.set(0, Math.PI, 0);
+
+              // Action - Update NPC Target: Exact position of the attached chair, NOT desk center
+              const chairPos = st.chairPosition || st.sitPoint;
+              const chairBaseY = chairPos.y || 0;
+              cust.mesh.position.set(chairPos.x, chairBaseY, chairPos.z);
+
+              // Action - Force Rotation: Force NPC transform.rotation.y to face the exact same direction as Monitor / Desk forward vector
+              const facingRot = st.deskFacingRotationY !== undefined ? st.deskFacingRotationY : Math.PI;
+              cust.mesh.rotation.set(0, facingRot, 0);
+
+              // Disable NPC Collision: Briefly disable / set CapsuleCollider to isTrigger = true so they don't get pushed out of chair by desk collider
+              cust.isTrigger = true;
+              if (cust.bodyLimbs?.capsuleCollider) {
+                cust.bodyLimbs.capsuleCollider.userData.isTrigger = true;
+                if ((cust.bodyLimbs.capsuleCollider.material as THREE.MeshBasicMaterial).color) {
+                  (cust.bodyLimbs.capsuleCollider.material as THREE.MeshBasicMaterial).color.setHex(0x06b6d4);
+                }
+              }
+
               animateCustomerLimbs(cust, 0, 'playing');
 
               const satResult = calculateSatisfactionCore(
@@ -4522,6 +5962,17 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
               addLog(`[${st.name}] ${cust.name} bắt đầu chơi! Điểm hài lòng: ${satResult.emoji} ${satResult.finalScore}đ (${satResult.stars}⭐)`);
               syncToParent();
             }
+          }
+        }
+
+        if (cust.state === 'playing' && cust.targetStationId) {
+          const st = stationsRef.current.find(s => s.id === cust.targetStationId);
+          if (st && cust.mesh) {
+            const chairPos = st.chairPosition || st.sitPoint;
+            const chairBaseY = chairPos.y || 0;
+            cust.mesh.position.set(chairPos.x, chairBaseY, chairPos.z);
+            const facingRot = st.deskFacingRotationY !== undefined ? st.deskFacingRotationY : Math.PI;
+            cust.mesh.rotation.set(0, facingRot, 0);
           }
         }
       }
@@ -4601,6 +6052,16 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
               // Khách đứng lên khỏi ghế và bắt đầu đi ra cửa!
               cust.state = 'leaving';
               cust.targetStationId = null;
+
+              // Restore collision when standing up:
+              cust.isTrigger = false;
+              if (cust.bodyLimbs?.capsuleCollider) {
+                cust.bodyLimbs.capsuleCollider.userData.isTrigger = false;
+                if ((cust.bodyLimbs.capsuleCollider.material as THREE.MeshBasicMaterial).color) {
+                  (cust.bodyLimbs.capsuleCollider.material as THREE.MeshBasicMaterial).color.setHex(0x10b981);
+                }
+              }
+
               if (cust.mesh) {
                 // Đứng dậy, lùi ra khỏi bàn ghế vào lối đi trung tâm
                 const aisleX = st.position.x > 0 ? 0.4 : -0.4;
@@ -4618,6 +6079,9 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       // 5. Update direct DOM Badges (Zero setState in loop)
       if (carryingTrayMeshRef.current) {
         carryingTrayMeshRef.current.visible = isCarryingFoodRef.current;
+      }
+      if (carryingPCBoxMeshRef.current) {
+        carryingPCBoxMeshRef.current.visible = isCarryingPCBoxRef.current;
       }
 
       if (cameraRef.current && mountRef.current) {
@@ -4723,8 +6187,216 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         spawnCustomer();
       }
 
+      // Continuous Traffic Simulation & Looping Traffic
+      for (const car of carsListRef.current) {
+        car.mesh.position.x += car.speed * delta;
+        if (car.speed > 0 && car.mesh.position.x > 50) {
+          car.mesh.position.x = -50;
+        } else if (car.speed < 0 && car.mesh.position.x < -50) {
+          car.mesh.position.x = 50;
+        }
+      }
+
+      // Player Collision (Frogger Mechanic):
+      // Distance check between Player and moving cars (< 2.0)
+      const nowMs = performance.now();
+      if (nowMs - lastCarHitTimeRef.current > 1800) {
+        for (const car of carsListRef.current) {
+          const distToCar = playerPosRef.current.distanceTo(car.mesh.position);
+          if (distToCar < 2.0) {
+            lastCarHitTimeRef.current = nowMs;
+            // Teleport player immediately back to Cyber Cafe sidewalk
+            playerPosRef.current.set(0, 1.6, 8.5);
+            if (cameraRef.current) {
+              cameraRef.current.position.copy(playerPosRef.current);
+            }
+            addLog('Bị xe tông! Hãy cẩn thận khi qua đường!', 'error');
+            triggerPopup('Bị xe tông! Hãy cẩn thận khi qua đường! 💥🚗', new THREE.Vector3(0, 1.6, 8.5), '#ef4444');
+            soundController.playPowerSwitch(false);
+            break;
+          }
+        }
+      }
+
+      // 6.6. Build Mode & Free Placement Logic (Internet Cafe Simulator Architecture):
+      // When in Build Mode, create a 'Ghost' mesh that follows player's crosshair via Raycasting
+      const activeBuild = buildModeItemRef.current;
+      const ghost = ghostMeshRef.current;
+      if (activeBuild && ghost && cameraRef.current) {
+        // Raycast from camera center forward
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(0, 0), cameraRef.current);
+
+        const camPos = cameraRef.current.position;
+        const camDir = new THREE.Vector3();
+        cameraRef.current.getWorldDirection(camDir);
+
+        let isValidSurface = false;
+        const targetPos = new THREE.Vector3();
+        let targetRotY = playerYawRef.current + ghostRotationYRef.current;
+        const itemCat = activeBuild.item.category;
+        const [bx, by, bz] = activeBuild.item.boxDimensions;
+
+        if (itemCat === 'Desk') {
+          // Desk ghosts raycast and snap to Floor (y = 0)
+          const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+          const hitPoint = new THREE.Vector3();
+          const ray = new THREE.Ray(camPos, camDir);
+          const hasHit = ray.intersectPlane(groundPlane, hitPoint);
+
+          if (hasHit && camPos.distanceTo(hitPoint) <= 8.0 && hitPoint.z < 26.0 && hitPoint.z > -16.0) {
+            targetPos.copy(hitPoint);
+            targetPos.y = 0;
+            isValidSurface = true;
+          } else {
+            targetPos.copy(camPos).add(camDir.clone().multiplyScalar(3.0));
+            targetPos.y = 0;
+            isValidSurface = true;
+          }
+          targetRotY = playerYawRef.current + ghostRotationYRef.current;
+          activeSnappedSlotRef.current = null;
+        } else {
+          // PC Components (Monitor, Keyboard, Mouse, PCCase, Headset, Chair):
+          // Auto-Snap Slot System: Snapping strictly to the predefined slot of that component on placed Desks!
+          let closestDesk: {
+            deskId: string;
+            group: THREE.Group;
+            center: THREE.Vector3;
+            rotationY: number;
+            topY: number;
+            slots: Record<string, PlacedFurnitureItem | null>;
+          } | null = null;
+          let minDeskDist = 999;
+
+          // Find closest placed custom desk within reach (<= 4.2m)
+          for (const d of Array.from(placedDesksRegistryRef.current.values())) {
+            const dist = playerPosRef.current.distanceTo(d.center);
+            if (dist <= 4.2 && dist < minDeskDist) {
+              minDeskDist = dist;
+              closestDesk = d;
+            }
+          }
+
+          if (closestDesk) {
+            const slotDef = DESK_SNAP_SLOTS.find(s => s.category === itemCat);
+            if (slotDef) {
+              const cos = Math.cos(closestDesk.rotationY);
+              const sin = Math.sin(closestDesk.rotationY);
+              const [rx, ry, rz] = slotDef.relativePos;
+              const slotWorldPos = new THREE.Vector3(
+                closestDesk.center.x + (rx * cos + rz * sin),
+                closestDesk.topY + ry,
+                closestDesk.center.z + (-rx * sin + rz * cos)
+              );
+              const slotWorldRotY = closestDesk.rotationY + slotDef.relativeRotY + ghostRotationYRef.current;
+
+              // Force ghost mesh to snap directly into this slot position and rotation!
+              targetPos.copy(slotWorldPos);
+              targetRotY = slotWorldRotY;
+
+              // Check if slot is already occupied
+              const isSlotOccupied = !!closestDesk.slots[slotDef.name];
+              if (isSlotOccupied) {
+                isValidSurface = false; // Occupied -> Red!
+                activeSnappedSlotRef.current = null;
+              } else {
+                isValidSurface = true; // Free -> Green!
+                activeSnappedSlotRef.current = {
+                  deskId: closestDesk.deskId,
+                  slotName: slotDef.name,
+                  worldPos: slotWorldPos,
+                  worldRotY: slotWorldRotY,
+                };
+              }
+            } else {
+              targetPos.copy(camPos).add(camDir.clone().multiplyScalar(2.5));
+              isValidSurface = false;
+              activeSnappedSlotRef.current = null;
+            }
+          } else {
+            // If Chair and not near a desk, allow free placement on floor
+            if (itemCat === 'Chair') {
+              const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+              const hitPoint = new THREE.Vector3();
+              const ray = new THREE.Ray(camPos, camDir);
+              const hasHit = ray.intersectPlane(groundPlane, hitPoint);
+              if (hasHit && camPos.distanceTo(hitPoint) <= 6.0) {
+                targetPos.copy(hitPoint);
+                targetPos.y = 0;
+                isValidSurface = true;
+              } else {
+                targetPos.copy(camPos).add(camDir.clone().multiplyScalar(2.5));
+                targetPos.y = 0;
+                isValidSurface = true;
+              }
+              targetRotY = playerYawRef.current + ghostRotationYRef.current;
+              activeSnappedSlotRef.current = null;
+            } else {
+              // Monitor, Keyboard, Mouse, PCCase, Headset MUST snap to a Desk!
+              targetPos.copy(camPos).add(camDir.clone().multiplyScalar(2.0));
+              targetRotY = playerYawRef.current + ghostRotationYRef.current;
+              isValidSurface = false; // Red!
+              activeSnappedSlotRef.current = null;
+            }
+          }
+        }
+
+        // Position & Rotate ghost hologram
+        ghost.position.lerp(targetPos, 0.45);
+        ghost.rotation.y = targetRotY;
+
+        // 4. Collision Validation (Red/Green Hologram):
+        const ghostBox = new THREE.Box3().setFromCenterAndSize(
+          new THREE.Vector3(ghost.position.x, ghost.position.y + by / 2, ghost.position.z),
+          new THREE.Vector3(bx * 0.85, by * 0.85, bz * 0.85)
+        );
+
+        let hasCollision = false;
+        // When snapping to a desk slot, ignore collision with that desk itself
+        for (const col of collidersRef.current) {
+          const colBox = new THREE.Box3(col.min, col.max);
+          if (ghostBox.intersectsBox(colBox)) {
+            if (activeSnappedSlotRef.current && col.name.includes(`CustomDesk_${activeSnappedSlotRef.current.deskId}`)) {
+              // Accessory on its snapped desk is valid!
+            } else {
+              hasCollision = true;
+              break;
+            }
+          }
+        }
+
+        const isValid = isValidSurface && !hasCollision;
+        isGhostValidRef.current = isValid;
+
+        const targetColor = isValid ? 0x00ff00 : 0xff0000;
+        ghost.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            if (child.material instanceof THREE.MeshBasicMaterial) {
+              child.material.color.setHex(targetColor);
+              child.material.transparent = true;
+              child.material.opacity = 0.55;
+            } else {
+              child.material = new THREE.MeshBasicMaterial({
+                color: targetColor,
+                transparent: true,
+                opacity: 0.55,
+                wireframe: false,
+              });
+            }
+          }
+        });
+      }
+
+      // Animate active Desk completion checkmarks (Pulsing & Rotating)
+      placedDesksRegistryRef.current.forEach((d) => {
+        if (d.checkmarkMesh && d.isReadyForCustomer) {
+          d.checkmarkMesh.rotation.y += delta * 1.6;
+          d.checkmarkMesh.position.y = d.topY + 1.15 + Math.sin(currentTime * 0.005) * 0.04;
+        }
+      });
+
       // 7. Distance & Interaction Target Detection (Fridge, NeedsFoodOrDrink Customer, Station Upgrade)
-      const FRIDGE_POSITION = new THREE.Vector3(2.8, 1.0, -5.2);
+      const FRIDGE_POSITION = new THREE.Vector3(3.2, 1.0, -5.1);
       const distToFridge = playerPosRef.current.distanceTo(FRIDGE_POSITION);
 
       let newInteraction: ActiveInteractionType = null;
@@ -4782,7 +6454,79 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         }
       }
 
-      if (propertyInteraction) {
+      // Smoothly animate VIP Door Hinge rotation (Pushes open to Math.PI / 2)
+      if (vipDoorHingeRef.current) {
+        const targetDoorAngle = isVipDoorOpenRef.current ? Math.PI / 2 : 0;
+        vipDoorHingeRef.current.rotation.y += (targetDoorAngle - vipDoorHingeRef.current.rotation.y) * Math.min(1, delta * 5.0);
+      }
+
+      // Check VIP Door proximity trigger ([E] Đẩy cửa phòng VIP / [E] Đóng cửa phòng VIP)
+      let vipDoorInteraction: ActiveInteractionType = null;
+      const VIP_DOOR_POS = new THREE.Vector3(-3.00, 1.0, -4.8);
+      const distToVipDoor = playerPosRef.current.distanceTo(VIP_DOOR_POS);
+      if (distToVipDoor <= 2.6) {
+        vipDoorInteraction = {
+          type: 'vip_door',
+          text: isVipDoorOpenRef.current ? `[${configRef.current.interactKey}] Đóng cửa phòng VIP` : `[${configRef.current.interactKey}] Đẩy cửa phòng VIP`,
+          subText: 'Phòng VIP Cyber Gaming • 10 Máy Đấu Giải Đỉnh Cao',
+        };
+      }
+
+      // Check Hardware Store Counter proximity trigger ([E] Mua Hộp Linh Kiện PC)
+      let hardwareStoreInteraction: ActiveInteractionType = null;
+      const HARDWARE_COUNTER_POS = new THREE.Vector3(0, 1.0, 31.8);
+      const distToHardwareCounter = playerPosRef.current.distanceTo(HARDWARE_COUNTER_POS);
+      if (distToHardwareCounter <= 2.4) {
+        hardwareStoreInteraction = {
+          type: 'hardware_store',
+          text: `[${configRef.current.interactKey}] Cửa Hàng PC Hardware & Bàn Ghế`,
+          subText: 'Mở Menu Shop 7 Linh Kiện & 5 Tiers • Mua đồ vào Balo [B]',
+        };
+      }
+
+      // Check Raycast for Placed Furniture Pickup ([F] Key):
+      let pickupFurnitureInteraction: ActiveInteractionType = null;
+      if (!activeBuild && cameraRef.current) {
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(0, 0), cameraRef.current);
+        raycaster.far = 3.6;
+
+        const testGroups: THREE.Object3D[] = [];
+        placedFurnitureGroupsRef.current.forEach((grp) => {
+          testGroups.push(grp);
+        });
+
+        const hits = raycaster.intersectObjects(testGroups, true);
+        if (hits.length > 0) {
+          let obj: THREE.Object3D | null = hits[0].object;
+          while (obj && !obj.userData?.instanceId && obj.parent) {
+            obj = obj.parent;
+          }
+          if (obj && obj.userData?.instanceId) {
+            const instId = obj.userData.instanceId;
+            const itemName = obj.userData.itemName || 'Linh Kiện';
+            pickupFurnitureInteraction = {
+              type: 'pickup_furniture',
+              instanceId: instId,
+              itemName: itemName,
+              text: `[F] Thu hồi: ${itemName}`,
+              subText: 'Nhấn [F] để tháo gỡ và cất lại vào Balo [B]',
+            };
+            activePickupFurnitureRef.current = { instanceId: instId, itemName };
+          }
+        }
+      }
+      if (!pickupFurnitureInteraction) {
+        activePickupFurnitureRef.current = null;
+      }
+
+      if (vipDoorInteraction) {
+        newInteraction = vipDoorInteraction;
+      } else if (hardwareStoreInteraction) {
+        newInteraction = hardwareStoreInteraction;
+      } else if (pickupFurnitureInteraction) {
+        newInteraction = pickupFurnitureInteraction;
+      } else if (propertyInteraction) {
         newInteraction = propertyInteraction;
       } else if (customerNeedingFood) {
         if (isCarryingFoodRef.current) {
@@ -4832,12 +6576,23 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         }
 
         if (closestStation) {
-          newInteraction = {
-            type: 'station_upgrade',
-            stationId: closestStation.id,
-            distance: parseFloat(minDistance.toFixed(2)),
-            text: `[${configRef.current.interactKey}] Nâng Cấp ${closestStation.name}`,
-          };
+          if (isCarryingPCBoxRef.current) {
+            newInteraction = {
+              type: 'station_upgrade',
+              stationId: closestStation.id,
+              distance: parseFloat(minDistance.toFixed(2)),
+              text: `[${configRef.current.interactKey}] Lắp Đặt Nâng Cấp ${closestStation.name} 📦`,
+              subText: 'Đang mang hộp linh kiện PC • Nhấn [E] để nâng cấp máy tính',
+            };
+          } else {
+            newInteraction = {
+              type: 'station_upgrade',
+              stationId: closestStation.id,
+              distance: parseFloat(minDistance.toFixed(2)),
+              text: `[${configRef.current.interactKey}] Nâng Cấp ${closestStation.name} (Cần Hộp Linh Kiện)`,
+              subText: 'Cần qua đường sang Cửa Hàng PC Hardware mua linh kiện (5.000.000 VNĐ)',
+            };
+          }
         }
       }
 
@@ -4943,15 +6698,41 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         case 'arrowright':
           moveInputRef.current.strafe = 1;
           break;
+        case 'b':
+          e.preventDefault();
+          setIsBackpackOpen(prev => !prev);
+          break;
+        case 'f':
+          e.preventDefault();
+          if (activePickupFurnitureRef.current) {
+            handlePickupFurniture(activePickupFurnitureRef.current.instanceId);
+          }
+          break;
+        case 'r':
+          if (buildModeItemRef.current) {
+            e.preventDefault();
+            const step = Math.PI / 4;
+            ghostRotationYRef.current = (ghostRotationYRef.current + step) % (Math.PI * 2);
+            triggerPopup(`🔄 Xoay: ${Math.round((ghostRotationYRef.current * 180) / Math.PI)}°`, playerPosRef.current, '#c084fc');
+          }
+          break;
         case configRef.current.interactKey.toLowerCase():
           e.preventDefault();
-          if (selectedUpgradeStationRef.current) {
+          if (buildModeItemRef.current) {
+            // In Build Mode, pressing [E] finalizes placement
+            handleFinalizeBuildPlacement();
+          } else if (selectedUpgradeStationRef.current) {
             setSelectedUpgradeStation(null);
           } else {
             handleInteract();
           }
           break;
         case 'escape':
+          if (buildModeItemRef.current) {
+            cancelBuildMode();
+          }
+          setIsHardwareShopOpen(false);
+          setIsBackpackOpen(false);
           setSelectedUpgradeStation(null);
           setInspectCustomer(null);
           break;
@@ -4975,18 +6756,817 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
       }
     };
 
+    // Item Rotation (Scroll Wheel): scrolling Mouse Wheel (Up/Down) rotates Ghost mesh around Y-axis
+    const handleWheel = (e: WheelEvent) => {
+      if (buildModeItemRef.current) {
+        e.preventDefault();
+        const step = Math.PI / 4; // 45 degrees
+        if (e.deltaY > 0) {
+          ghostRotationYRef.current = (ghostRotationYRef.current + step) % (Math.PI * 2);
+        } else {
+          ghostRotationYRef.current = (ghostRotationYRef.current - step + Math.PI * 2) % (Math.PI * 2);
+        }
+        triggerPopup(`🔄 Xoay: ${Math.round((ghostRotationYRef.current * 180) / Math.PI)}°`, playerPosRef.current, '#c084fc');
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('wheel', handleWheel);
     };
   }, []); // Strictly empty dependency array
 
+  // Build Mode Hologram & Solid Furniture Creation Helpers
+  const createItemMeshGroup = (item: HardwareItemDefinition, isGhost: boolean): THREE.Group => {
+    const group = new THREE.Group();
+    const greenMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.5 });
+    const redMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.5 });
+
+    const getMaterial = (baseColor: string | number, emissiveColor?: string | number) => {
+      if (isGhost) {
+        return isGhostValidRef.current ? greenMat : redMat;
+      }
+      return new THREE.MeshStandardMaterial({
+        color: baseColor,
+        roughness: 0.35,
+        metalness: 0.5,
+        emissive: emissiveColor || 0x000000,
+        emissiveIntensity: emissiveColor ? 1.5 : 0,
+      });
+    };
+
+    const [bx, by, bz] = item.boxDimensions;
+
+    switch (item.category) {
+      case 'Desk': {
+        // Table top
+        const topGeo = new THREE.BoxGeometry(bx, 0.05, bz);
+        const topMesh = new THREE.Mesh(topGeo, getMaterial(item.primaryColor));
+        topMesh.position.y = by - 0.025;
+        topMesh.castShadow = !isGhost;
+        topMesh.receiveShadow = !isGhost;
+        group.add(topMesh);
+
+        // LED Neon Edge Strip for T3, T4, T5
+        if (item.tier >= 3 && item.accentColor) {
+          const edgeGeo = new THREE.BoxGeometry(bx + 0.02, 0.015, bz + 0.02);
+          const edgeMesh = new THREE.Mesh(edgeGeo, getMaterial(item.accentColor, item.glowColor || item.accentColor));
+          edgeMesh.position.y = by - 0.04;
+          group.add(edgeMesh);
+        }
+
+        // 4 Legs
+        const legRadius = 0.035;
+        const legHeight = by - 0.05;
+        const legGeo = new THREE.CylinderGeometry(legRadius, legRadius, legHeight, 12);
+        const legMat = getMaterial(0x1e293b);
+
+        const legOffsets = [
+          [-bx / 2 + 0.08, -bz / 2 + 0.08],
+          [bx / 2 - 0.08, -bz / 2 + 0.08],
+          [-bx / 2 + 0.08, bz / 2 - 0.08],
+          [bx / 2 - 0.08, bz / 2 - 0.08],
+        ];
+
+        legOffsets.forEach(([ox, oz]) => {
+          const leg = new THREE.Mesh(legGeo, legMat);
+          leg.position.set(ox, legHeight / 2, oz);
+          leg.castShadow = !isGhost;
+          group.add(leg);
+        });
+        break;
+      }
+
+      case 'Chair': {
+        // Seat cushion
+        const seatGeo = new THREE.BoxGeometry(bx * 0.85, 0.08, bz * 0.85);
+        const seatMesh = new THREE.Mesh(seatGeo, getMaterial(item.primaryColor));
+        seatMesh.position.y = 0.45;
+        group.add(seatMesh);
+
+        // Backrest
+        const backHeight = by - 0.45;
+        const backGeo = new THREE.BoxGeometry(bx * 0.8, backHeight, 0.08);
+        const backMesh = new THREE.Mesh(backGeo, getMaterial(item.accentColor));
+        backMesh.position.set(0, 0.45 + backHeight / 2, -bz * 0.35);
+        group.add(backMesh);
+
+        // Headrest / Wings for T3, T4, T5
+        if (item.tier >= 3) {
+          const headGeo = new THREE.BoxGeometry(bx * 0.5, 0.16, 0.1);
+          const headMesh = new THREE.Mesh(headGeo, getMaterial(item.glowColor || item.accentColor));
+          headMesh.position.set(0, by - 0.1, -bz * 0.35);
+          group.add(headMesh);
+        }
+
+        // Piston & Star Base
+        const pistonGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.45, 12);
+        const pistonMesh = new THREE.Mesh(pistonGeo, getMaterial(0x334155));
+        pistonMesh.position.y = 0.225;
+        group.add(pistonMesh);
+
+        // 5 Wheels base
+        const baseGeo = new THREE.CylinderGeometry(bx * 0.45, bx * 0.45, 0.04, 8);
+        const baseMesh = new THREE.Mesh(baseGeo, getMaterial(0x0f172a));
+        baseMesh.position.y = 0.04;
+        group.add(baseMesh);
+        break;
+      }
+
+      case 'Monitor': {
+        // Stand base
+        const baseGeo = new THREE.CylinderGeometry(0.12, 0.14, 0.02, 16);
+        const baseMesh = new THREE.Mesh(baseGeo, getMaterial(0x1e293b));
+        baseMesh.position.y = 0.01;
+        group.add(baseMesh);
+
+        // Stand pole
+        const poleGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.22, 12);
+        const poleMesh = new THREE.Mesh(poleGeo, getMaterial(0x334155));
+        poleMesh.position.y = 0.11;
+        group.add(poleMesh);
+
+        // Screen bezel & panel
+        const screenGeo = new THREE.BoxGeometry(bx, by - 0.12, 0.03);
+        const screenMesh = new THREE.Mesh(screenGeo, getMaterial(item.primaryColor));
+        screenMesh.position.set(0, 0.12 + (by - 0.12) / 2, 0);
+        group.add(screenMesh);
+
+        // Display panel glow
+        const dispGeo = new THREE.PlaneGeometry(bx * 0.94, (by - 0.12) * 0.9);
+        const dispMat = isGhost
+          ? (isGhostValidRef.current ? greenMat : redMat)
+          : new THREE.MeshBasicMaterial({ color: item.glowColor || 0x06b6d4 });
+        const dispMesh = new THREE.Mesh(dispGeo, dispMat);
+        dispMesh.position.set(0, 0.12 + (by - 0.12) / 2, 0.018);
+        group.add(dispMesh);
+        break;
+      }
+
+      case 'PCCase': {
+        // Main tower body
+        const caseGeo = new THREE.BoxGeometry(bx, by, bz);
+        const caseMesh = new THREE.Mesh(caseGeo, getMaterial(item.primaryColor));
+        caseMesh.position.y = by / 2;
+        group.add(caseMesh);
+
+        // Glass side panel
+        const glassGeo = new THREE.PlaneGeometry(bz * 0.85, by * 0.85);
+        const glassMat = isGhost
+          ? (isGhostValidRef.current ? greenMat : redMat)
+          : new THREE.MeshStandardMaterial({
+              color: 0x111827,
+              transparent: true,
+              opacity: 0.6,
+              roughness: 0.1,
+            });
+        const glassMesh = new THREE.Mesh(glassGeo, glassMat);
+        glassMesh.position.set(bx / 2 + 0.002, by / 2, 0);
+        glassMesh.rotation.y = Math.PI / 2;
+        group.add(glassMesh);
+
+        // ARGB Front LED Bars
+        if (item.accentColor) {
+          const ledGeo = new THREE.BoxGeometry(bx * 0.8, 0.02, 0.01);
+          const ledMesh = new THREE.Mesh(ledGeo, getMaterial(item.accentColor, item.glowColor || item.accentColor));
+          ledMesh.position.set(0, by * 0.7, bz / 2 + 0.002);
+          group.add(ledMesh);
+        }
+        break;
+      }
+
+      case 'Keyboard': {
+        const kbGeo = new THREE.BoxGeometry(bx, by, bz);
+        const kbMesh = new THREE.Mesh(kbGeo, getMaterial(item.primaryColor));
+        kbMesh.position.y = by / 2;
+        group.add(kbMesh);
+
+        // Keycaps surface
+        const keysGeo = new THREE.BoxGeometry(bx * 0.92, 0.015, bz * 0.85);
+        const keysMesh = new THREE.Mesh(keysGeo, getMaterial(item.accentColor, item.glowColor));
+        keysMesh.position.y = by + 0.005;
+        group.add(keysMesh);
+        break;
+      }
+
+      case 'Mouse': {
+        const mouseGeo = new THREE.BoxGeometry(bx, by, bz);
+        const mouseMesh = new THREE.Mesh(mouseGeo, getMaterial(item.primaryColor));
+        mouseMesh.position.y = by / 2;
+        group.add(mouseMesh);
+
+        // Mousepad underneath
+        const padGeo = new THREE.BoxGeometry(bx * 2.8, 0.005, bz * 2.2);
+        const padMesh = new THREE.Mesh(padGeo, getMaterial(0x0f172a, item.accentColor));
+        padMesh.position.y = 0.002;
+        group.add(padMesh);
+        break;
+      }
+
+      case 'Headset': {
+        // Headband arch
+        const bandGeo = new THREE.TorusGeometry(bx * 0.42, 0.015, 8, 24, Math.PI);
+        const bandMesh = new THREE.Mesh(bandGeo, getMaterial(item.primaryColor));
+        bandMesh.position.set(0, by * 0.7, 0);
+        bandMesh.rotation.z = Math.PI;
+        group.add(bandMesh);
+
+        // 2 Ear cups
+        const cupGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.04, 16);
+        [-bx * 0.42, bx * 0.42].forEach(ox => {
+          const cup = new THREE.Mesh(cupGeo, getMaterial(item.accentColor, item.glowColor));
+          cup.position.set(ox, by * 0.4, 0);
+          cup.rotation.z = Math.PI / 2;
+          group.add(cup);
+        });
+        break;
+      }
+    }
+
+    return group;
+  };
+
+  // Create faint transparent wireframe holograms for bare desk slots to guide the player
+  const createSlotGuideHologram = (_slotName: DeskSlotName, category: HardwareCategory): THREE.Group => {
+    const group = new THREE.Group();
+    const holoMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.32,
+      wireframe: true,
+    });
+
+    switch (category) {
+      case 'Monitor': {
+        const scr = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.36, 0.03), holoMat);
+        scr.position.y = 0.28;
+        group.add(scr);
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.18, 8), holoMat);
+        pole.position.y = 0.09;
+        group.add(pole);
+        const base = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.015, 12), holoMat);
+        base.position.y = 0.008;
+        group.add(base);
+        break;
+      }
+      case 'Keyboard': {
+        const kb = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.02, 0.15), holoMat);
+        kb.position.y = 0.01;
+        group.add(kb);
+        break;
+      }
+      case 'Mouse': {
+        const mouse = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.03, 0.13), holoMat);
+        mouse.position.y = 0.015;
+        group.add(mouse);
+        const pad = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.005, 0.22), holoMat);
+        pad.position.y = 0.002;
+        group.add(pad);
+        break;
+      }
+      case 'PCCase': {
+        const pc = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.44, 0.42), holoMat);
+        pc.position.y = 0.22;
+        group.add(pc);
+        break;
+      }
+      case 'Headset': {
+        const arch = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.012, 6, 16, Math.PI), holoMat);
+        arch.position.y = 0.12;
+        arch.rotation.z = Math.PI;
+        group.add(arch);
+        break;
+      }
+      case 'Chair': {
+        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.06, 0.5), holoMat);
+        seat.position.y = 0.45;
+        group.add(seat);
+        const back = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.58, 0.06), holoMat);
+        back.position.set(0, 0.74, -0.2);
+        group.add(back);
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.45, 8), holoMat);
+        pole.position.y = 0.225;
+        group.add(pole);
+        break;
+      }
+    }
+    return group;
+  };
+
+  // Show floating 3D Green Checkmark UI Icon above completed desk (temporary: 2.5s)
+  const showDeskCompletionCheckmark = (deskRecord: {
+    deskId: string;
+    center: THREE.Vector3;
+    topY: number;
+    checkmarkMesh?: THREE.Group;
+    checkmarkTimeoutId?: any;
+  }) => {
+    // Clear any previous timer or existing mesh
+    if (deskRecord.checkmarkTimeoutId) {
+      clearTimeout(deskRecord.checkmarkTimeoutId);
+      deskRecord.checkmarkTimeoutId = undefined;
+    }
+    if (deskRecord.checkmarkMesh && sceneRef.current) {
+      sceneRef.current.remove(deskRecord.checkmarkMesh);
+      deskRecord.checkmarkMesh = undefined;
+    }
+
+    const checkmarkGroup = new THREE.Group();
+
+    // Glowing outer ring
+    const ringGeo = new THREE.TorusGeometry(0.26, 0.025, 12, 32);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x34d399 });
+    const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+    checkmarkGroup.add(ringMesh);
+
+    // Center circular badge
+    const discGeo = new THREE.CylinderGeometry(0.24, 0.24, 0.02, 24);
+    const discMat = new THREE.MeshBasicMaterial({ color: 0x059669, transparent: true, opacity: 0.9 });
+    const discMesh = new THREE.Mesh(discGeo, discMat);
+    discMesh.rotation.x = Math.PI / 2;
+    checkmarkGroup.add(discMesh);
+
+    // White Checkmark limbs '✓'
+    const armMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const arm1 = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.13, 0.035), armMat);
+    arm1.position.set(-0.06, -0.04, 0.02);
+    arm1.rotation.z = -Math.PI / 4;
+    checkmarkGroup.add(arm1);
+
+    const arm2 = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.24, 0.035), armMat);
+    arm2.position.set(0.05, 0.03, 0.02);
+    arm2.rotation.z = Math.PI / 4;
+    checkmarkGroup.add(arm2);
+
+    checkmarkGroup.position.set(deskRecord.center.x, deskRecord.topY + 1.15, deskRecord.center.z);
+    sceneRef.current?.add(checkmarkGroup);
+    deskRecord.checkmarkMesh = checkmarkGroup;
+
+    // Action: Wrap display logic in a timer. Show for 2.5s, then automatically destroy / hide!
+    deskRecord.checkmarkTimeoutId = setTimeout(() => {
+      if (deskRecord.checkmarkMesh) {
+        deskRecord.checkmarkMesh.visible = false;
+        if (sceneRef.current) {
+          sceneRef.current.remove(deskRecord.checkmarkMesh);
+        }
+        deskRecord.checkmarkMesh = undefined;
+      }
+      deskRecord.checkmarkTimeoutId = undefined;
+    }, 2500);
+  };
+
+  // Register newly completed desk into active stations so NPC customers can pathfind to it
+  const registerDeskAsCustomerStation = (deskRecord: {
+    deskId: string;
+    group: THREE.Group;
+    center: THREE.Vector3;
+    rotationY: number;
+    slots: {
+      Monitor: PlacedFurnitureItem | null;
+      Keyboard: PlacedFurnitureItem | null;
+      Mouse: PlacedFurnitureItem | null;
+      PCCase: PlacedFurnitureItem | null;
+      Chair: PlacedFurnitureItem | null;
+    };
+    stationId?: number;
+  }) => {
+    const stationId = 100 + stationsRef.current.length;
+    deskRecord.stationId = stationId;
+
+    const pcTier = deskRecord.slots.PCCase?.tier || 2;
+    const monTier = deskRecord.slots.Monitor?.tier || 2;
+    const chairTier = deskRecord.slots.Chair?.tier || 2;
+
+    const newStation: StationUpgradeState = {
+      id: stationId,
+      name: `Bàn PC Custom #${stationId - 99} (${deskRecord.slots.PCCase?.item.tierName || 'Gaming'})`,
+      isOccupied: false,
+      timeRemaining: 0,
+      position: deskRecord.center.clone(),
+      sitPoint: deskRecord.center.clone(),
+      gpuLevel: pcTier,
+      ramLevel: pcTier,
+      monitorLevel: monTier,
+      currentCustomerType: '',
+      totalEarnedFromStation: 0,
+      stationGroup: deskRecord.group,
+      screenMesh: undefined,
+      screenLight: undefined,
+      pcCaseLedMesh: undefined,
+      parentDeskId: deskRecord.deskId,
+    };
+
+    // Query attached chair and calculate exact sitPoint, cushion height, and screen facing rotation
+    updateStationChairTransform(newStation);
+    stationsRef.current.push(newStation);
+  };
+
+  // Raycast Pickup ([F] Key): Tháo gỡ vật phẩm và cất lại vào Balo
+  const handlePickupFurniture = (instanceId: string) => {
+    const itemIndex = placedFurnitureRef.current.findIndex(p => p.instanceId === instanceId);
+    if (itemIndex === -1) return;
+    const placedItem = placedFurnitureRef.current[itemIndex];
+
+    // If picking up a Desk:
+    if (placedItem.category === 'Desk') {
+      const deskRecord = placedDesksRegistryRef.current.get(instanceId);
+      if (deskRecord) {
+        // 1. Return any accessories attached to this desk back to backpack
+        const slotKeys: DeskSlotName[] = ['Monitor', 'Keyboard', 'Mouse', 'PCCase', 'Headset', 'Chair'];
+        slotKeys.forEach(sName => {
+          const attached = deskRecord.slots[sName];
+          if (attached) {
+            const attMesh = placedFurnitureGroupsRef.current.get(attached.instanceId);
+            if (attMesh && sceneRef.current) {
+              sceneRef.current.remove(attMesh);
+            }
+            placedFurnitureGroupsRef.current.delete(attached.instanceId);
+            placedFurnitureCollidersRef.current.delete(attached.instanceId);
+            placedFurnitureRef.current = placedFurnitureRef.current.filter(p => p.instanceId !== attached.instanceId);
+
+            const recoveredAtt: InventoryBackpackItem = {
+              instanceId: `bp_${Date.now()}_${Math.random()}`,
+              itemDefId: attached.itemDefId,
+              item: attached.item,
+              acquiredAt: Date.now(),
+            };
+            backpackRef.current = [...backpackRef.current, recoveredAtt];
+          }
+        });
+
+        // 2. Remove holograms from scene
+        Object.values(deskRecord.holograms).forEach(holo => {
+          if (holo && sceneRef.current) sceneRef.current.remove(holo);
+        });
+
+        // 3. Remove checkmark
+        if (deskRecord.checkmarkTimeoutId) {
+          clearTimeout(deskRecord.checkmarkTimeoutId);
+          deskRecord.checkmarkTimeoutId = undefined;
+        }
+        if (deskRecord.checkmarkMesh && sceneRef.current) {
+          sceneRef.current.remove(deskRecord.checkmarkMesh);
+          deskRecord.checkmarkMesh = undefined;
+        }
+
+        // 4. Remove active customer station if registered
+        if (deskRecord.stationId) {
+          stationsRef.current = stationsRef.current.filter(s => s.id !== deskRecord.stationId);
+        }
+
+        // 5. Remove collider and boundary references
+        collidersRef.current = collidersRef.current.filter(c => c.name !== `CustomDesk_${instanceId}`);
+        placedDesksBoundsRef.current = placedDesksBoundsRef.current.filter(d => d.id !== instanceId);
+        placedDesksRegistryRef.current.delete(instanceId);
+      }
+    } else {
+      // If picking up an accessory placed in a Desk slot
+      if (placedItem.parentDeskId && placedItem.slotType) {
+        const parentDesk = placedDesksRegistryRef.current.get(placedItem.parentDeskId);
+        if (parentDesk) {
+          parentDesk.slots[placedItem.slotType] = null;
+          // Re-show faint guide hologram for this empty slot!
+          if (parentDesk.holograms[placedItem.slotType]) {
+            parentDesk.holograms[placedItem.slotType]!.visible = true;
+          }
+          // If desk was ready for customer, mark false and hide checkmark
+          if (parentDesk.isReadyForCustomer) {
+            parentDesk.isReadyForCustomer = false;
+            if (parentDesk.checkmarkTimeoutId) {
+              clearTimeout(parentDesk.checkmarkTimeoutId);
+              parentDesk.checkmarkTimeoutId = undefined;
+            }
+            if (parentDesk.checkmarkMesh && sceneRef.current) {
+              sceneRef.current.remove(parentDesk.checkmarkMesh);
+              parentDesk.checkmarkMesh = undefined;
+            }
+            if (parentDesk.stationId) {
+              stationsRef.current = stationsRef.current.filter(s => s.id !== parentDesk.stationId);
+            }
+            triggerPopup('⚠️ Bàn máy bị tháo linh kiện! Tạm ngừng nhận khách.', parentDesk.center, '#ef4444');
+            addLog(`[Cyber Setup] Đã tháo ${placedItem.item.name}! Bàn máy tạm dừng đón khách vì chưa đủ 5 món.`, 'info');
+          }
+        }
+      }
+    }
+
+    // Remove the 3D solid mesh from scene
+    const solidMesh = placedFurnitureGroupsRef.current.get(instanceId);
+    if (solidMesh && sceneRef.current) {
+      sceneRef.current.remove(solidMesh);
+    }
+    placedFurnitureGroupsRef.current.delete(instanceId);
+    placedFurnitureCollidersRef.current.delete(instanceId);
+    placedFurnitureRef.current = placedFurnitureRef.current.filter(p => p.instanceId !== instanceId);
+
+    // Push item back to Backpack array
+    const recoveredItem: InventoryBackpackItem = {
+      instanceId: `bp_${Date.now()}_${Math.random()}`,
+      itemDefId: placedItem.itemDefId,
+      item: placedItem.item,
+      acquiredAt: Date.now(),
+    };
+    const updatedBackpack = [...backpackRef.current, recoveredItem];
+    backpackRef.current = updatedBackpack;
+    setBackpack(updatedBackpack);
+
+    // Audio chime & notification popup
+    soundController.playCashChime();
+    triggerPopup(`📦 Đã thu hồi: ${placedItem.item.name}! (Cất vào Balo)`, playerPosRef.current, '#38bdf8');
+    addLog(`[Thu Hồi - Phím F] Đã thu hồi ${placedItem.item.name} về Balo [B].`, 'success');
+    activePickupFurnitureRef.current = null;
+  };
+
+  // Enter Build Mode from Backpack
+  const enterBuildMode = (entry: InventoryBackpackItem) => {
+    setIsBackpackOpen(false);
+    setBuildModeItem(entry);
+    buildModeItemRef.current = entry;
+    ghostRotationYRef.current = 0; // Reset rotation offset
+
+    // Remove old ghost if any
+    if (ghostMeshRef.current && sceneRef.current) {
+      sceneRef.current.remove(ghostMeshRef.current);
+      ghostMeshRef.current = null;
+    }
+
+    if (!sceneRef.current) return;
+
+    // Create ghost mesh
+    const ghost = createItemMeshGroup(entry.item, true);
+    ghostMeshRef.current = ghost;
+    sceneRef.current.add(ghost);
+
+    addLog(`Đã vào Chế Độ Đặt (Build Mode): ${entry.item.name}. Cuộn chuột/R để xoay, Chuột Trái/[E] để đặt!`, 'info');
+    triggerPopup(`🔧 Bắt đầu đặt: ${entry.item.name} (Cuộn chuột/R để xoay)`, playerPosRef.current, '#38bdf8');
+  };
+
+  // Cancel Build Mode
+  const cancelBuildMode = () => {
+    if (ghostMeshRef.current && sceneRef.current) {
+      sceneRef.current.remove(ghostMeshRef.current);
+      ghostMeshRef.current = null;
+    }
+    setBuildModeItem(null);
+    buildModeItemRef.current = null;
+    activeSnappedSlotRef.current = null;
+    addLog('Đã thoát Chế Độ Đặt (Build Mode).', 'info');
+  };
+
+  // Finalize placement (Left Click or [E])
+  const handleFinalizeBuildPlacement = () => {
+    const active = buildModeItemRef.current;
+    const ghost = ghostMeshRef.current;
+    if (!active || !ghost || !sceneRef.current) return;
+
+    if (!isGhostValidRef.current) {
+      addLog('Vị trí không hợp lệ! Đang bị va chạm hoặc khe cắm đã có linh kiện.', 'error');
+      triggerPopup('Vị trí không hợp lệ! ❌', ghost.position, '#ef4444');
+      soundController.playPowerSwitch(false);
+      return;
+    }
+
+    // 1. Instantiate the real solid 3D object at exact Ghost position and rotation
+    const solidMesh = createItemMeshGroup(active.item, false);
+    solidMesh.position.copy(ghost.position);
+    solidMesh.rotation.copy(ghost.rotation);
+    sceneRef.current.add(solidMesh);
+
+    const isDesk = active.item.category === 'Desk';
+    const snapped = activeSnappedSlotRef.current;
+
+    // 2. Save to placed items array
+    const placedEntry: PlacedFurnitureItem = {
+      instanceId: `placed_${Date.now()}_${Math.random()}`,
+      itemDefId: active.itemDefId,
+      category: active.item.category,
+      tier: active.item.tier,
+      position: [solidMesh.position.x, solidMesh.position.y, solidMesh.position.z],
+      rotationY: solidMesh.rotation.y,
+      item: active.item,
+      parentDeskId: snapped ? snapped.deskId : undefined,
+      slotType: snapped ? snapped.slotName : undefined,
+    };
+
+    // Assign BoxCollider and Raycast Interactable Layer metadata
+    solidMesh.userData = {
+      interactable: true,
+      pickupable: true,
+      instanceId: placedEntry.instanceId,
+      itemName: active.item.name,
+      category: active.item.category,
+      tier: active.item.tier,
+      parentDeskId: placedEntry.parentDeskId,
+      slotType: placedEntry.slotType,
+    };
+
+    placedFurnitureRef.current.push(placedEntry);
+    placedFurnitureGroupsRef.current.set(placedEntry.instanceId, solidMesh);
+    placedFurnitureCollidersRef.current.set(placedEntry.instanceId, new THREE.Box3().setFromObject(solidMesh));
+
+    // 3. Desk Auto-Snap Slots & Hardware Holograms Setup
+    if (isDesk) {
+      const box = new THREE.Box3().setFromObject(solidMesh);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const topY = solidMesh.position.y + active.item.boxDimensions[1];
+
+      // Spawn faint guide holograms for the desk slots
+      const hologramsMap: Record<string, THREE.Group> = {};
+      DESK_SNAP_SLOTS.forEach(sDef => {
+        const holo = createSlotGuideHologram(sDef.name, sDef.category);
+        const cos = Math.cos(solidMesh.rotation.y);
+        const sin = Math.sin(solidMesh.rotation.y);
+        const [rx, ry, rz] = sDef.relativePos;
+        const wX = solidMesh.position.x + (rx * cos + rz * sin);
+        const wY = topY + ry;
+        const wZ = solidMesh.position.z + (-rx * sin + rz * cos);
+        holo.position.set(wX, wY, wZ);
+        holo.rotation.y = solidMesh.rotation.y + sDef.relativeRotY;
+        sceneRef.current?.add(holo);
+        hologramsMap[sDef.name] = holo;
+      });
+
+      placedDesksRegistryRef.current.set(placedEntry.instanceId, {
+        deskId: placedEntry.instanceId,
+        group: solidMesh,
+        deskItem: active.item,
+        center: solidMesh.position.clone(),
+        rotationY: solidMesh.rotation.y,
+        topY: topY,
+        box: box,
+        size: size,
+        isReadyForCustomer: false,
+        slots: {
+          Monitor: null,
+          Keyboard: null,
+          Mouse: null,
+          PCCase: null,
+          Headset: null,
+          Chair: null,
+        },
+        holograms: hologramsMap,
+      });
+
+      placedDesksBoundsRef.current.push({
+        id: placedEntry.instanceId,
+        box,
+        topY,
+        center: solidMesh.position.clone(),
+        size,
+      });
+
+      // Add physical collider to world
+      collidersRef.current.push({
+        name: `CustomDesk_${placedEntry.instanceId}`,
+        min: new THREE.Vector3(
+          solidMesh.position.x - active.item.boxDimensions[0] / 2,
+          0,
+          solidMesh.position.z - active.item.boxDimensions[2] / 2
+        ),
+        max: new THREE.Vector3(
+          solidMesh.position.x + active.item.boxDimensions[0] / 2,
+          active.item.boxDimensions[1],
+          solidMesh.position.z + active.item.boxDimensions[2] / 2
+        ),
+      });
+
+      addLog(`Đã lắp đặt Bàn Máy Tính! Hologram hướng dẫn 5 vị trí linh kiện đã kích hoạt.`, 'info');
+    } else if (snapped) {
+      // Snapped into a specific Desk Slot!
+      const parentDesk = placedDesksRegistryRef.current.get(snapped.deskId);
+      if (parentDesk) {
+        parentDesk.slots[snapped.slotName] = placedEntry;
+
+        // Hide corresponding hologram mesh
+        if (parentDesk.holograms[snapped.slotName]) {
+          parentDesk.holograms[snapped.slotName]!.visible = false;
+        }
+
+        // 'Ready to Play' Validation: Check if ALL 5 main slots are filled!
+        const s = parentDesk.slots;
+        const allFilled = !!(s.Monitor && s.Keyboard && s.Mouse && s.PCCase && s.Chair);
+
+        if (allFilled && !parentDesk.isReadyForCustomer) {
+          parentDesk.isReadyForCustomer = true;
+          showDeskCompletionCheckmark(parentDesk);
+          registerDeskAsCustomerStation(parentDesk);
+          triggerPopup('🎉 BÀN MÁY ĐÃ HOÀN THIỆN 100%! Khách hàng có thể vào chơi! ✅🎮', parentDesk.center, '#10b981');
+          addLog(`[Cyber Setup] Hoàn thiện trọn bộ 5/5 linh kiện trên bàn (${parentDesk.deskItem.name})! Đã sẵn sàng đón khách.`, 'success');
+        } else {
+          const missing: string[] = [];
+          if (!s.Monitor) missing.push('Màn hình');
+          if (!s.PCCase) missing.push('Case PC');
+          if (!s.Keyboard) missing.push('Bàn phím');
+          if (!s.Mouse) missing.push('Chuột');
+          if (!s.Chair) missing.push('Ghế');
+          if (missing.length > 0) {
+            addLog(`Đã gắn ${active.item.name} vào bàn! Còn thiếu: ${missing.join(', ')} để đón khách.`, 'info');
+          }
+        }
+      }
+    } else if (active.item.category === 'Chair') {
+      // If Chair was placed freely without snapping, check if there is an unequipped desk nearby (<= 2.2m)
+      let nearbyDesk: any = null;
+      let minDeskDist = 2.2;
+      for (const d of placedDesksRegistryRef.current.values()) {
+        if (!d.slots.Chair) {
+          const dist = solidMesh.position.distanceTo(d.center);
+          if (dist < minDeskDist) {
+            minDeskDist = dist;
+            nearbyDesk = d;
+          }
+        }
+      }
+
+      if (nearbyDesk) {
+        placedEntry.parentDeskId = nearbyDesk.deskId;
+        placedEntry.slotType = 'Chair';
+        solidMesh.userData.parentDeskId = nearbyDesk.deskId;
+        solidMesh.userData.slotType = 'Chair';
+        nearbyDesk.slots.Chair = placedEntry;
+        if (nearbyDesk.holograms.Chair) {
+          nearbyDesk.holograms.Chair.visible = false;
+        }
+
+        const s = nearbyDesk.slots;
+        const allFilled = !!(s.Monitor && s.Keyboard && s.Mouse && s.PCCase && s.Chair);
+        if (allFilled && !nearbyDesk.isReadyForCustomer) {
+          nearbyDesk.isReadyForCustomer = true;
+          showDeskCompletionCheckmark(nearbyDesk);
+          registerDeskAsCustomerStation(nearbyDesk);
+          triggerPopup('🎉 BÀN MÁY ĐÃ HOÀN THIỆN 100%! Khách hàng có thể vào chơi! ✅🎮', nearbyDesk.center, '#10b981');
+          addLog(`[Cyber Setup] Hoàn thiện trọn bộ 5/5 linh kiện trên bàn (${nearbyDesk.deskItem.name})! Đã sẵn sàng đón khách.`, 'success');
+        }
+      }
+    }
+
+    // 4. Remove the item from Backpack
+    const remaining = backpackRef.current.filter(b => b.instanceId !== active.instanceId);
+    setBackpack(remaining);
+    backpackRef.current = remaining;
+
+    soundController.playCashChime();
+    addLog(`Đã lắp đặt thành công: ${active.item.name}!`, 'success');
+    triggerPopup(`✅ Đã lắp đặt: ${active.item.name} 🔨`, solidMesh.position, '#10b981');
+
+    // 5. Check if player has more of the same item in backpack
+    const nextSame = remaining.find(b => b.itemDefId === active.itemDefId);
+    if (nextSame) {
+      setBuildModeItem(nextSame);
+      buildModeItemRef.current = nextSame;
+      if (ghostMeshRef.current && sceneRef.current) {
+        sceneRef.current.remove(ghostMeshRef.current);
+      }
+      const newGhost = createItemMeshGroup(nextSame.item, true);
+      ghostMeshRef.current = newGhost;
+      sceneRef.current.add(newGhost);
+      addLog(`Tiếp tục đặt món thứ 2 (${nextSame.item.name}) trong Balo...`, 'info');
+    } else {
+      cancelBuildMode();
+    }
+  };
+
+  // Buy item from Hardware Store UI
+  const handleBuyItemFromStore = (item: HardwareItemDefinition): boolean => {
+    if (totalMoneyRef.current < item.price) {
+      addLog(`Không đủ tiền! Cần ${item.price.toLocaleString('vi-VN')} VNĐ để mua ${item.name}.`, 'error');
+      triggerPopup(`Không đủ tiền mua ${item.name}! ❌`, playerPosRef.current, '#ef4444');
+      soundController.playPowerSwitch(false);
+      return false;
+    }
+
+    // Deduct money
+    setTotalMoney(m => m - item.price);
+    if (onMoneyEarnedRef.current) onMoneyEarnedRef.current(-item.price);
+
+    // Add to backpack
+    const newEntry: InventoryBackpackItem = {
+      instanceId: `bp_${Date.now()}_${Math.random()}`,
+      itemDefId: item.id,
+      item,
+      acquiredAt: Date.now(),
+    };
+    setBackpack(prev => [...prev, newEntry]);
+    backpackRef.current = [...backpackRef.current, newEntry];
+
+    soundController.playCashChime();
+    addLog(`Đã mua ${item.name} (-${item.price.toLocaleString('vi-VN')} VNĐ)! Đã cất vào Balo [B].`, 'success');
+    triggerPopup(`🛍️ Đã mua ${item.name}! Nhấn [B] để xem Balo`, playerPosRef.current, '#10b981');
+    return true;
+  };
+
   // Pointer controls
+  const pointerStartPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
   const handlePointerDown = (e: React.PointerEvent) => {
     isPointerDownRef.current = true;
     lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
+    pointerStartPosRef.current = { x: e.clientX, y: e.clientY };
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
@@ -5000,8 +7580,16 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
     playerPitchRef.current = Math.max(-1.2, Math.min(1.2, playerPitchRef.current));
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e: React.PointerEvent) => {
     isPointerDownRef.current = false;
+    // Check if it was a quick click without much dragging (e.g., < 8 pixels)
+    const dist = Math.hypot(e.clientX - pointerStartPosRef.current.x, e.clientY - pointerStartPosRef.current.y);
+    if (dist < 8) {
+      if (buildModeItemRef.current) {
+        // Left click in Build Mode finalizes placement!
+        handleFinalizeBuildPlacement();
+      }
+    }
   };
 
   const handleBadgeSlotClick = (slotIdx: number) => {
@@ -5151,6 +7739,23 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
 
         {/* Right Tools */}
         <div className="flex items-center gap-2 pointer-events-auto">
+          <button
+            onClick={() => setIsBackpackOpen(true)}
+            className="px-3.5 py-2 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5 shadow-md transition-all active:scale-95 border border-emerald-400/40"
+            title="Mở Balo [Phím B] chứa linh kiện & bàn ghế đã mua"
+          >
+            <Package className="w-3.5 h-3.5 text-emerald-200" />
+            <span>Balo [B] ({backpack.length})</span>
+          </button>
+
+          <button
+            onClick={() => setIsHardwareShopOpen(true)}
+            className="px-3.5 py-2 rounded-lg text-xs font-bold bg-cyan-600 hover:bg-cyan-500 text-white flex items-center gap-1.5 shadow-md transition-all active:scale-95 border border-cyan-400/40"
+            title="Mở Cửa Hàng PC Hardware & Nội Thất"
+          >
+            <ShoppingBag className="w-3.5 h-3.5 text-cyan-200" />
+            <span>Shop PC</span>
+          </button>
           <button
             onClick={toggleCapsuleColliders}
             className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all shadow-md ${
@@ -5383,13 +7988,88 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
                 </div>
               </div>
             </div>
+          ) : activeInteraction.type === 'vip_door' ? (
+            <button
+              onClick={handleInteract}
+              className="bg-amber-950/95 border-2 border-amber-400 backdrop-blur-md rounded-2xl px-6 py-3.5 shadow-[0_0_35px_rgba(245,158,11,0.6)] flex items-center gap-3.5 hover:scale-105 active:scale-95 transition-transform animate-pulse"
+            >
+              <div className="w-11 h-11 rounded-xl bg-amber-500/30 text-amber-300 flex items-center justify-center font-bold text-2xl border border-amber-400/40">
+                🚪
+              </div>
+              <div className="text-left">
+                <div className="text-xs uppercase font-semibold text-amber-400 flex items-center gap-2">
+                  <span>VIP ZONE • PHÒNG ĐẤU GIẢI</span>
+                  <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono text-[10px] border border-amber-500/40">
+                    12 MÁY GAMING
+                  </span>
+                </div>
+                <div className="text-sm md:text-base font-bold text-white flex items-center gap-2 mt-0.5">
+                  <span className="px-2 py-0.5 rounded bg-amber-400 text-slate-950 font-mono text-xs font-black">
+                    [{config.interactKey}]
+                  </span>
+                  <span>{isVipDoorOpen ? 'Đóng cửa phòng VIP' : 'Đẩy cửa phòng VIP'}</span>
+                </div>
+              </div>
+            </button>
+          ) : activeInteraction.type === 'hardware_store' ? (
+            <button
+              onClick={handleInteract}
+              className="bg-cyan-950/95 border-2 border-cyan-400 text-cyan-100 shadow-[0_0_35px_rgba(6,182,212,0.6)] backdrop-blur-md rounded-2xl px-6 py-3.5 flex items-center gap-3.5 hover:scale-105 active:scale-95 transition-transform animate-pulse"
+            >
+              <div className="w-11 h-11 rounded-xl bg-cyan-500/20 text-cyan-300 flex items-center justify-center font-bold text-2xl border border-cyan-400/40">
+                ⚡
+              </div>
+              <div className="text-left">
+                <div className="text-xs uppercase font-semibold text-cyan-300 flex items-center gap-2">
+                  <span>PC HARDWARE &amp; UPGRADES STORE</span>
+                  <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono text-[10px] border border-cyan-500/40">
+                    7 LOẠI • 5 TIERS
+                  </span>
+                </div>
+                <div className="text-sm md:text-base font-bold text-white flex items-center gap-2 mt-0.5">
+                  <span className="px-2 py-0.5 rounded bg-cyan-400 text-slate-950 font-mono text-xs font-black">
+                    [{config.interactKey}]
+                  </span>
+                  <span>Mở Menu Cửa Hàng Linh Kiện &amp; Bàn Ghế</span>
+                </div>
+              </div>
+            </button>
+          ) : activeInteraction.type === 'pickup_furniture' ? (
+            <button
+              onClick={handleInteract}
+              className="bg-indigo-950/95 border-2 border-indigo-400 text-indigo-100 shadow-[0_0_35px_rgba(99,102,241,0.6)] backdrop-blur-md rounded-2xl px-6 py-3.5 flex items-center gap-3.5 hover:scale-105 active:scale-95 transition-transform animate-pulse"
+            >
+              <div className="w-11 h-11 rounded-xl bg-indigo-500/20 text-indigo-300 flex items-center justify-center font-bold text-2xl border border-indigo-400/40">
+                📦
+              </div>
+              <div className="text-left">
+                <div className="text-xs uppercase font-semibold text-indigo-300 flex items-center gap-2">
+                  <span>THU HỒI VẬT PHẨM ĐÃ ĐẶT</span>
+                  <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono text-[10px] border border-indigo-500/40">
+                    CẤT VÀO BALO [B]
+                  </span>
+                </div>
+                <div className="text-sm md:text-base font-bold text-white flex items-center gap-2 mt-0.5">
+                  <span className="px-2 py-0.5 rounded bg-indigo-400 text-slate-950 font-mono text-xs font-black">
+                    [F]
+                  </span>
+                  <span>Tháo gỡ &amp; Cất vào Balo: {activeInteraction.itemName}</span>
+                </div>
+              </div>
+            </button>
           ) : (
             <button
-              onClick={openUpgradeModal}
-              className="bg-slate-950/95 border-2 border-emerald-400/80 backdrop-blur-md rounded-2xl px-6 py-3.5 shadow-2xl flex items-center gap-3.5 hover:scale-105 active:scale-95 transition-transform"
+              onClick={handleInteract}
+              className={`border-2 backdrop-blur-md rounded-2xl px-6 py-3.5 shadow-2xl flex items-center gap-3.5 hover:scale-105 active:scale-95 transition-transform ${
+                isCarryingPCBox
+                  ? 'bg-emerald-950/95 border-emerald-400/90 text-emerald-100 shadow-[0_0_30px_rgba(16,185,129,0.5)] animate-pulse'
+                  : 'bg-slate-950/95 border-slate-700 text-slate-300'
+              }`}
             >
-              <div className="w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold">
-                <Cpu className="w-5 h-5" />
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold ${
+                isCarryingPCBox ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-400'
+              }`}>
+                {isCarryingPCBox ? '📦' : <Cpu className="w-5 h-5" />}
               </div>
               <div className="text-left">
                 <div className="text-xs uppercase font-semibold text-emerald-400">
@@ -5399,7 +8079,11 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
                   <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-400 font-mono text-xs border border-slate-700">
                     [{config.interactKey}]
                   </span>
-                  <span>Nâng Cấp Linh Kiện &rarr; Tăng Điểm Hài Lòng Khách</span>
+                  {isCarryingPCBox ? (
+                    <span className="text-emerald-300">Lắp Đặt Nâng Cấp Linh Kiện [E] 🚀</span>
+                  ) : (
+                    <span>Nâng Cấp Máy (Cần qua shop đối diện mua linh kiện 📦)</span>
+                  )}
                 </div>
               </div>
             </button>
@@ -5424,6 +8108,26 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
               </div>
               <div className="text-[10px] text-amber-200">
                 Tiến lại bàn khách gọi món &bull; Bấm [{config.interactKey}] Phục vụ
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PLAYER CARRYING PC HARDWARE BOX HUD BADGE (isCarryingPCBox = true) */}
+      {isCarryingPCBox && (
+        <div className="absolute bottom-6 right-4 md:right-6 z-30 animate-in fade-in slide-in-from-bottom-2">
+          <div className="bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-700 text-white px-4 py-3 rounded-2xl border-2 border-emerald-300 shadow-[0_0_30px_rgba(16,185,129,0.7)] flex items-center gap-3.5">
+            <div className="w-10 h-10 rounded-xl bg-black/40 border border-emerald-400/50 flex items-center justify-center text-2xl animate-bounce shadow-inner">
+              📦
+            </div>
+            <div>
+              <div className="text-[11px] font-black uppercase tracking-wider text-emerald-100 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-300 animate-ping" />
+                <span>ĐANG MANG HỘP LINH KIỆN PC</span>
+              </div>
+              <div className="text-xs font-semibold text-white">
+                Mang về bàn máy tiệm net &amp; nhấn <span className="bg-white/20 px-1.5 py-0.5 rounded font-mono text-white font-bold">[{config.interactKey}]</span> để nâng cấp
               </div>
             </div>
           </div>
@@ -5818,6 +8522,8 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
                   ? 'bg-gradient-to-tr from-amber-600 via-yellow-500 to-amber-400 text-white ring-4 ring-amber-400/80 scale-105 active:scale-95 animate-pulse'
                   : activeInteraction.type === 'serve'
                   ? 'bg-gradient-to-tr from-emerald-600 via-amber-500 to-emerald-400 text-white ring-4 ring-emerald-400/80 scale-105 active:scale-95 animate-pulse'
+                  : activeInteraction.type === 'vip_door'
+                  ? 'bg-gradient-to-tr from-amber-500 via-yellow-400 to-orange-500 text-slate-950 ring-4 ring-amber-400/90 scale-105 active:scale-95'
                   : activeInteraction.type === 'fridge'
                   ? 'bg-gradient-to-tr from-sky-600 to-amber-500 text-white ring-4 ring-sky-400/80 scale-105 active:scale-95'
                   : 'bg-gradient-to-tr from-emerald-600 to-teal-400 text-white ring-4 ring-emerald-400/50 scale-105 active:scale-95'
@@ -5834,6 +8540,11 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
                 <span className="text-xl mb-0.5">🍲</span>
                 <span className="text-[10px] uppercase font-black">PHỤC VỤ</span>
               </>
+            ) : activeInteraction?.type === 'vip_door' ? (
+              <>
+                <span className="text-xl mb-0.5">🚪</span>
+                <span className="text-[10px] uppercase font-black">{isVipDoorOpen ? 'ĐÓNG CỬA' : 'ĐẨY CỬA'}</span>
+              </>
             ) : activeInteraction?.type === 'fridge' ? (
               <>
                 <span className="text-xl mb-0.5">🥤</span>
@@ -5849,6 +8560,89 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
         </div>
       )}
 
+      {/* BUILD MODE ACTIVE OVERLAY BANNER */}
+      {buildModeItem && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-40 pointer-events-auto animate-in slide-in-from-top-2">
+          <div className="bg-slate-950/95 border-2 border-emerald-400 rounded-2xl px-6 py-3.5 shadow-[0_0_35px_rgba(16,185,129,0.5)] backdrop-blur-md flex flex-wrap items-center gap-4">
+            <div className="w-11 h-11 rounded-xl bg-emerald-500/20 text-2xl flex items-center justify-center border border-emerald-400/40 animate-bounce">
+              {buildModeItem.item.icon}
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-black uppercase text-emerald-300">
+                  CHẾ ĐỘ ĐẶT TỰ DO (BUILD MODE)
+                </span>
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-400/40">
+                  {buildModeItem.item.category} • Tier {buildModeItem.item.tier}
+                </span>
+                <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300 border border-purple-400/40">
+                  🔄 Xoay: {Math.round((ghostRotationYRef.current * 180) / Math.PI)}°
+                </span>
+              </div>
+              <div className="text-sm font-bold text-white flex items-center gap-3 mt-0.5">
+                <span>{buildModeItem.item.name}</span>
+                <span className="text-xs font-semibold text-sky-400">
+                  {buildModeItem.item.category === 'Desk'
+                    ? '📍 Snap Sàn Nhà (Tự sinh 5 Khe Cắm & Hologram)'
+                    : activeSnappedSlotRef.current
+                    ? `🎯 Đã khóa vào khe ${activeSnappedSlotRef.current.slotName}`
+                    : '⚡ Tự Động Khóa Vào Khe Cắm Trên Bàn (Auto-Snap)'}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 pl-3 border-l border-slate-800">
+              <button
+                onClick={() => {
+                  ghostRotationYRef.current = (ghostRotationYRef.current + Math.PI / 4) % (Math.PI * 2);
+                  triggerPopup(`🔄 Xoay: ${Math.round((ghostRotationYRef.current * 180) / Math.PI)}°`, playerPosRef.current, '#c084fc');
+                }}
+                className="px-3 py-2 rounded-xl bg-purple-950/80 hover:bg-purple-900 border border-purple-500/60 text-purple-200 font-bold text-xs shadow-md transition-all active:scale-95 flex items-center gap-1.5"
+                title="Cuộn Chuột (Mouse Wheel) hoặc bấm phím [R] để xoay"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Xoay 45° [Cuộn/R]</span>
+              </button>
+              <button
+                onClick={handleFinalizeBuildPlacement}
+                className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs shadow-md transition-all active:scale-95 flex items-center gap-1.5"
+                title="Chuột Trái hoặc [E] để xác nhận đặt"
+              >
+                <Hammer className="w-3.5 h-3.5" />
+                <span>Đặt [E / Click]</span>
+              </button>
+              <button
+                onClick={cancelBuildMode}
+                className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-rose-900/60 hover:text-rose-200 text-slate-400 font-bold text-xs border border-slate-700 transition-all"
+                title="Hủy Chế Độ Đặt [Esc]"
+              >
+                Hủy [Esc]
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2D HARDWARE STORE UI OVERLAY */}
+      <HardwareShopModal
+        isOpen={isHardwareShopOpen}
+        onClose={() => setIsHardwareShopOpen(false)}
+        totalFunds={totalMoney}
+        onBuyItem={handleBuyItemFromStore}
+      />
+
+      {/* 2D BACKPACK INVENTORY UI OVERLAY */}
+      <BackpackModal
+        isOpen={isBackpackOpen}
+        onClose={() => setIsBackpackOpen(false)}
+        backpack={backpack}
+        onSelectItemForBuild={enterBuildMode}
+        onDiscardItem={(id) => {
+          setBackpack(b => b.filter(item => item.instanceId !== id));
+          backpackRef.current = backpackRef.current.filter(item => item.instanceId !== id);
+          addLog('Đã bỏ bớt 1 món khỏi Balo.', 'info');
+        }}
+      />
+
       {/* Bottom hint bar */}
       {!isMobileMode && (
         <div className="absolute bottom-3 left-4 right-4 flex items-center justify-between text-xs text-slate-400 pointer-events-none z-20">
@@ -5858,15 +8652,19 @@ export const ThreeSimulator: React.FC<ThreeSimulatorProps> = ({
             </span>
             <span>·</span>
             <span>
-              Tủ Mát / Phục vụ / Nâng Cấp: bấm <kbd className="px-1.5 py-0.5 rounded bg-amber-900 text-amber-200 font-mono">[{config.interactKey}]</kbd>
+              Balo: <kbd className="px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 font-mono font-bold">[B]</kbd>
             </span>
             <span>·</span>
-            <span className="text-amber-400 font-medium">
-              🍜 Giao Mì Cay &amp; Sting: +15.000 VNĐ &bull; +5đ Hài Lòng
+            <span>
+              Tương tác / Quầy / Đặt đồ: bấm <kbd className="px-1.5 py-0.5 rounded bg-amber-900 text-amber-200 font-mono">[{config.interactKey}]</kbd>
+            </span>
+            <span>·</span>
+            <span className="text-cyan-400 font-medium">
+              ⚡ Shop Hardware 7 Loại x 5 Tiers &bull; Build Mode Internet Cafe Simulator
             </span>
           </div>
           <div className="bg-slate-950/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800/80 text-emerald-400 font-mono">
-            Hàng Đợi + F&amp;B + Base 70đ
+            Hàng Đợi + F&amp;B + Base 70đ + Free Placement
           </div>
         </div>
       )}

@@ -275,6 +275,9 @@ public class ComputerStation : MonoBehaviour
     public string stationName = "${config.stationNamePrefix}01";
     public bool isOccupied = false;
     public Transform sitPoint;
+    public Transform attachedChair;
+    public Transform monitorTransform;
+    public float seatCushionHeight = 0.5f;
     public float timeRemaining = 0f;
 
     [Header("Cấp Độ Nâng Cấp Linh Kiện (Cấp 1 -> 5)")]
@@ -582,7 +585,9 @@ public class CustomerAI : MonoBehaviour
             satisfactionSystem.ApplyPriceFactor(10000f);
         }
 
-        targetPoint = assignedPC.sitPoint != null ? assignedPC.sitPoint : assignedPC.transform;
+        // Action - Update NPC Target: Navigation destination must be the exact position of ATTACHED CHAIR, NOT desk center
+        Transform chairTarget = assignedPC.attachedChair != null ? assignedPC.attachedChair : (assignedPC.sitPoint != null ? assignedPC.sitPoint : assignedPC.transform);
+        targetPoint = chairTarget;
         ChangeState(CustomerState.WalkToSeatPoint);
     }
 
@@ -608,10 +613,32 @@ public class CustomerAI : MonoBehaviour
 
     private void HandleSitDown()
     {
-        if (assignedPC != null && assignedPC.sitPoint != null)
+        if (assignedPC != null)
         {
-            transform.position = assignedPC.sitPoint.position;
-            transform.rotation = assignedPC.sitPoint.rotation;
+            Transform chairTransform = assignedPC.attachedChair != null ? assignedPC.attachedChair : assignedPC.sitPoint;
+            if (chairTransform != null)
+            {
+                // Action - Set Y-Axis Offset: Match seat cushion height (chair.position.y + 0.5f)
+                Vector3 sitPos = chairTransform.position;
+                sitPos.y += assignedPC.seatCushionHeight;
+                transform.position = sitPos;
+
+                // Action - Force Rotation: Face exact forward vector of Monitor / Desk
+                Vector3 screenTarget = assignedPC.monitorTransform != null ? assignedPC.monitorTransform.position : assignedPC.transform.position;
+                Vector3 lookDir = (screenTarget - sitPos);
+                lookDir.y = 0;
+                if (lookDir != Vector3.zero)
+                {
+                    transform.rotation = Quaternion.LookRotation(lookDir, Vector3.up);
+                }
+            }
+        }
+
+        // Action - Disable NPC Collision: Briefly set CapsuleCollider to isTrigger = true while seated
+        CapsuleCollider col = GetComponent<CapsuleCollider>();
+        if (col != null)
+        {
+            col.isTrigger = true;
         }
 
         ChangeState(CustomerState.Playing);
@@ -625,6 +652,12 @@ public class CustomerAI : MonoBehaviour
     {
         if (assignedPC == null || assignedPC.timeRemaining <= 0.05f || !assignedPC.isOccupied)
         {
+            // Restore collision when standing up
+            CapsuleCollider col = GetComponent<CapsuleCollider>();
+            if (col != null)
+            {
+                col.isTrigger = false;
+            }
             ChangeState(CustomerState.FinishPlaying);
         }
     }
@@ -2379,5 +2412,799 @@ public class PropertyPurchasingManager : MonoBehaviour
 `;
 }
 
+export function generateVipDoorControllerScript(config: ScriptConfig = defaultScriptConfig): string {
+  return `// =================================================================================================
+// TÊN FILE: VipDoorController.cs
+// TÁC VỤ: Bản Lề Cửa Phòng VIP (Hinge Pivot), Đồng Bộ Collider (isTrigger = true khi mở) & NavMesh Update
+// PHÒNG VIP CYBER ARENA: Lối Vào Rộng 1.6m • 10 Máy Đấu Giải • Điều Hòa AC 18°C Inverter
+// =================================================================================================
+using System.Collections;
+using UnityEngine;
+using UnityEngine.AI;
 
+[RequireComponent(typeof(AudioSource))]
+public class VipDoorController : MonoBehaviour
+{
+    [Header("Bản Lề Hinge Pivot & Góc Xoay")]
+    [Tooltip("Empty GameObject đóng vai trò trục xoay bản lề đặt tại mép cửa jamb (-3.4, 0, -4.8)")]
+    [SerializeField] private Transform hingePivot;
+    [Tooltip("Góc mở cửa (90 độ = Math.PI / 2)")]
+    [SerializeField] private float openAngle = 90f;
+    [SerializeField] private float rotationSpeed = 5.0f;
+
+    [Header("Vật Lý & BoxCollider Đồng Bộ")]
+    [Tooltip("BoxCollider của cánh cửa gắn làm con của Hinge Pivot")]
+    [SerializeField] private BoxCollider doorCollider;
+    [Tooltip("Bật chế độ hoàn toàn giải phóng va chạm (isTrigger = true) khi cửa mở")]
+    [SerializeField] private bool disableColliderWhenOpen = true;
+
+    [Header("AI Navigation & Pathfinding")]
+    [Tooltip("NavMeshObstacle gắn trên cửa để cập nhật đường đi cho AI NPC")]
+    [SerializeField] private NavMeshObstacle navMeshObstacle;
+
+    [Header("Tương Tác & Phím Bấm")]
+    [SerializeField] private KeyCode interactKey = KeyCode.${config.interactKey.toUpperCase()};
+    [SerializeField] private float interactDistance = 2.5f;
+    [SerializeField] private GameObject interactionPromptUI;
+    [SerializeField] private TMPro.TextMeshProUGUI promptText;
+
+    [Header("Âm Thanh")]
+    [SerializeField] private AudioClip doorOpenSound;
+    [SerializeField] private AudioClip doorCloseSound;
+    private AudioSource audioSource;
+
+    [Header("Trạng Thái Cửa")]
+    [SerializeField] private bool isOpen = false;
+    public bool IsOpen => isOpen;
+
+    private float currentAngle = 0f;
+    private Coroutine rotateCoroutine;
+    private Transform playerCameraTransform;
+
+    private void Awake()
+    {
+        audioSource = GetComponent<AudioSource>();
+        if (hingePivot == null) hingePivot = transform;
+        if (doorCollider == null) doorCollider = GetComponentInChildren<BoxCollider>();
+        if (navMeshObstacle == null) navMeshObstacle = GetComponent<NavMeshObstacle>();
+
+        Camera mainCam = Camera.main;
+        if (mainCam != null) playerCameraTransform = mainCam.transform;
+    }
+
+    private void Start()
+    {
+        UpdateDoorPhysicsAndNavMesh(immediate: true);
+        HidePrompt();
+    }
+
+    private void Update()
+    {
+        CheckPlayerProximityAndInput();
+    }
+
+    private void CheckPlayerProximityAndInput()
+    {
+        if (playerCameraTransform == null) return;
+
+        float distance = Vector3.Distance(playerCameraTransform.position, transform.position);
+        if (distance <= interactDistance)
+        {
+            ShowPrompt(isOpen ? $"[{interactKey}] Đóng cửa phòng VIP" : $"[{interactKey}] Đẩy cửa phòng VIP");
+
+            if (Input.GetKeyDown(interactKey))
+            {
+                ToggleDoor();
+            }
+        }
+        else
+        {
+            HidePrompt();
+        }
+    }
+
+    public void ToggleDoor()
+    {
+        isOpen = !isOpen;
+
+        // Phát âm thanh cánh cửa
+        if (audioSource != null)
+        {
+            AudioClip clipToPlay = isOpen ? doorOpenSound : doorCloseSound;
+            if (clipToPlay != null) audioSource.PlayOneShot(clipToPlay);
+        }
+
+        // Bắt đầu diễn hoạt xoay bản lề mượt mà
+        if (rotateCoroutine != null) StopCoroutine(rotateCoroutine);
+        rotateCoroutine = StartCoroutine(AnimateHingeRotation(isOpen ? openAngle : 0f));
+
+        // Đồng bộ Collider và NavMesh
+        UpdateDoorPhysicsAndNavMesh(immediate: false);
+
+        Debug.Log($"<color={(isOpen ? "green" : "yellow")}>🚪 [VIP ZONE] {(isOpen ? "Đã đẩy mở cửa phòng VIP (Lối vào 1.6m thông suốt)!" : "Đã đóng cửa phòng VIP.")}</color>");
+    }
+
+    /// <summary>
+    /// ĐỒNG BỘ VẬT LÝ & NAVMESH:
+    /// - Khi cửa MỞ: BoxCollider chuyển thành isTrigger = true (hoặc tắt) để người chơi bước qua 0% va chạm cản trở.
+    ///   NavMeshObstacle tắt carving để NavMeshAgent xem khe cửa là đường đi bộ mở hoàn toàn.
+    /// - Khi cửa ĐÓNG: BoxCollider chuyển thành solid (isTrigger = false) và NavMeshObstacle bật carving.
+    /// </summary>
+    private void UpdateDoorPhysicsAndNavMesh(bool immediate)
+    {
+        if (doorCollider != null)
+        {
+            if (disableColliderWhenOpen)
+            {
+                // Khi mở: isTrigger = true để hoàn toàn giải phóng physical volume
+                doorCollider.isTrigger = isOpen;
+            }
+            else
+            {
+                doorCollider.enabled = !isOpen;
+            }
+        }
+
+        if (navMeshObstacle != null)
+        {
+            // Cập nhật NavMesh động: khi cửa mở, giải phóng đường đi để NPC AI tự do bước vào
+            navMeshObstacle.carving = !isOpen;
+            navMeshObstacle.enabled = !isOpen;
+        }
+    }
+
+    private IEnumerator AnimateHingeRotation(float targetAngle)
+    {
+        while (Mathf.Abs(currentAngle - targetAngle) > 0.05f)
+        {
+            currentAngle = Mathf.Lerp(currentAngle, targetAngle, Time.deltaTime * rotationSpeed);
+            if (hingePivot != null)
+            {
+                hingePivot.localRotation = Quaternion.Euler(0, currentAngle, 0);
+            }
+            yield return null;
+        }
+
+        currentAngle = targetAngle;
+        if (hingePivot != null)
+        {
+            hingePivot.localRotation = Quaternion.Euler(0, currentAngle, 0);
+        }
+    }
+
+    private void ShowPrompt(string message)
+    {
+        if (interactionPromptUI != null) interactionPromptUI.SetActive(true);
+        if (promptText != null) promptText.text = message;
+    }
+
+    private void HidePrompt()
+    {
+        if (interactionPromptUI != null) interactionPromptUI.SetActive(false);
+    }
+}
+`;
+}
+
+/// <summary>
+/// 13. HardwareShopAndPlacementSystem.cs
+/// C# Architecture for Internet Cafe Simulator Style 7 Component Types x 5 Tiers & Free-form Placement
+/// </summary>
+export function generateHardwarePlacementSystemScript(config?: ScriptConfig): string {
+  const interactKey = config?.interactKey || 'E';
+  return `using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// HỆ THỐNG CỬA HÀNG LINH KIỆN, BALO INVENTORY, AUTO-SNAP SLOTS & THU HỒI [F] (INTERNET CAFE SIMULATOR)
+/// Kiến trúc C# hoàn chỉnh:
+/// 1. Fix Raycast Pickup ([F] Key): Gán Interactable Layer + BoxCollider, phím [F] thu hồi vật phẩm về Balo
+/// 2. Item Rotation (Scroll Wheel): Cuộn chuột Up/Down xoay Ghost quanh trục Y theo góc 45 độ
+/// 3. Desk Auto-Snap Slots: Bàn tự động có 5 khe cắm chuẩn (Monitor, Keyboard, Mouse, Case, Headset, Chair)
+/// 4. Hardware Holograms & 'Ready to Play' Validation: Hiện hologram mờ hướng dẫn, ẩn khi lắp đủ.
+///    Khi đủ 5 món (Monitor, Phím, Chuột, Case, Ghế) -> isReadyForCustomer = true, hiện Checkmark xanh, khách NPC tự tìm đến chơi!
+/// </summary>
+public class HardwareShopAndPlacementSystem : MonoBehaviour
+{
+    public enum ComponentType
+    {
+        Monitor,
+        PCCase,
+        Mouse,
+        Keyboard,
+        Headset,
+        Desk,
+        Chair
+    }
+
+    public enum ComponentTier
+    {
+        Tier1_Standard,
+        Tier2_Gaming,
+        Tier3_Mechanical,
+        Tier4_Premium,
+        Tier5_Esports
+    }
+
+    [System.Serializable]
+    public class HardwareItemData
+    {
+        public string itemId;
+        public string itemName;
+        public ComponentType type;
+        public ComponentTier tier;
+        public int price;
+        public GameObject solidPrefab;
+        public GameObject ghostHologramPrefab;
+        public Vector3 boxDimensions;
+        public bool snapsToDesk; // true = Snaps to Desk Top Slot, false = Floor
+    }
+
+    [Header("=== Cấu Hình Phím Bấm & Cự Ly ===")]
+    [SerializeField] private KeyCode backpackKey = KeyCode.B;
+    [SerializeField] private KeyCode interactKey = KeyCode.${interactKey};
+    [SerializeField] private KeyCode pickupKey = KeyCode.F;
+    [SerializeField] private float raycastDistance = 6.0f;
+    [SerializeField] private float pickupRaycastDistance = 3.5f;
+    [SerializeField] private LayerMask floorLayerMask;
+    [SerializeField] private LayerMask deskSurfaceLayerMask;
+    [SerializeField] private LayerMask placedFurnitureLayerMask;
+    [SerializeField] private LayerMask obstacleLayerMask;
+
+    [Header("=== Vật Liệu Ghost Hologram ===")]
+    [SerializeField] private Material ghostValidGreenMaterial;   // Color: 0x00FF00, Opacity: 0.55
+    [SerializeField] private Material ghostInvalidRedMaterial;  // Color: 0xFF0000, Opacity: 0.55
+
+    [Header("=== Trạng Thái Hiện Tại ===")]
+    [SerializeField] private bool isInBuildMode = false;
+    [SerializeField] private bool isGhostPlacementValid = false;
+    [SerializeField] private HardwareItemData activeBuildItem = null;
+    [SerializeField] private GameObject activeGhostInstance = null;
+    [SerializeField] private float ghostRotationAngleY = 0f; // Scroll wheel rotation (deg)
+
+    [Header("=== Auto-Snap Slot Hiện Tại ===")]
+    [SerializeField] private DeskStationController activeSnappedDesk = null;
+    [SerializeField] private ComponentType activeSnappedSlotType;
+    [SerializeField] private Vector3 activeSnappedWorldPos;
+    [SerializeField] private Quaternion activeSnappedWorldRot;
+
+    [Header("=== Balo Lưu Trữ Người Chơi (Backpack) ===")]
+    [SerializeField] private List<HardwareItemData> playerBackpack = new List<HardwareItemData>();
+
+    [Header("=== Tham Chiếu Camera & UI ===")]
+    [SerializeField] private Camera playerCamera;
+    [SerializeField] private GameObject backpackUIPanel;
+    [SerializeField] private GameObject hardwareShopUIPanel;
+    [SerializeField] private GameObject pickupPromptUI;
+    [SerializeField] private UnityEngine.UI.Text pickupPromptText;
+
+    private static HardwareShopAndPlacementSystem _instance;
+    public static HardwareShopAndPlacementSystem Instance => _instance;
+
+    private void Awake()
+    {
+        if (_instance == null) _instance = this;
+        else Destroy(gameObject);
+    }
+
+    private void Start()
+    {
+        if (playerCamera == null) playerCamera = Camera.main;
+        if (backpackUIPanel != null) backpackUIPanel.SetActive(false);
+        if (hardwareShopUIPanel != null) hardwareShopUIPanel.SetActive(false);
+        if (pickupPromptUI != null) pickupPromptUI.SetActive(false);
+    }
+
+    private void Update()
+    {
+        // 1. Phím tắt mở Balo [B]
+        if (Input.GetKeyDown(backpackKey))
+        {
+            ToggleBackpackUI();
+        }
+
+        // 2. Chế độ Build Mode: Raycast Hologram, Snap Surface & Scroll Rotation
+        if (isInBuildMode && activeGhostInstance != null && activeBuildItem != null)
+        {
+            // 2.1. Item Rotation (Scroll Wheel): Cuộn chuột xoay Ghost quanh trục Y theo nấc 45 độ
+            float scroll = Input.GetAxis("Mouse ScrollWheel");
+            if (Mathf.Abs(scroll) > 0.02f)
+            {
+                ghostRotationAngleY += Mathf.Sign(scroll) * 45f;
+                ghostRotationAngleY = (ghostRotationAngleY + 360f) % 360f;
+            }
+            if (Input.GetKeyDown(KeyCode.R))
+            {
+                ghostRotationAngleY = (ghostRotationAngleY + 45f) % 360f;
+            }
+
+            UpdateGhostPlacement();
+
+            // 2.2. Phím xác nhận đặt món đồ: Chuột Trái hoặc [E]
+            if (Input.GetMouseButtonDown(0) || Input.GetKeyDown(interactKey))
+            {
+                TryFinalizePlacement();
+            }
+
+            // Hủy đặt bằng phím chuột phải hoặc Escape
+            if (Input.GetMouseButtonDown(1) || Input.GetKeyDown(KeyCode.Escape))
+            {
+                CancelBuildMode();
+            }
+        }
+        else
+        {
+            // 3. Phím [F] Raycast Pickup: Thu hồi linh kiện đã đặt về Balo
+            CheckPickupRaycast();
+        }
+    }
+
+    /// <summary>
+    /// 1. Fix Raycast Pickup (The [F] Key):
+    /// Raycast phát hiện đồ nội thất đã đặt, bấm [F] xóa khỏi scene và đẩy lại vào Balo
+    /// </summary>
+    private void CheckPickupRaycast()
+    {
+        Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
+        RaycastHit hit;
+
+        if (Physics.Raycast(ray, out hit, pickupRaycastDistance, placedFurnitureLayerMask))
+        {
+            PlacedItemComponent placedComp = hit.collider.GetComponentInParent<PlacedItemComponent>();
+            if (placedComp != null)
+            {
+                if (pickupPromptUI != null) pickupPromptUI.SetActive(true);
+                if (pickupPromptText != null) pickupPromptText.text = $"[F] Thu hồi & cất Balo: {placedComp.itemData.itemName}";
+
+                if (Input.GetKeyDown(pickupKey))
+                {
+                    PickupPlacedItem(placedComp);
+                }
+                return;
+            }
+        }
+
+        if (pickupPromptUI != null) pickupPromptUI.SetActive(false);
+    }
+
+    private void PickupPlacedItem(PlacedItemComponent comp)
+    {
+        if (comp == null || comp.itemData == null) return;
+
+        // Đẩy dữ liệu trở lại Balo
+        playerBackpack.Add(comp.itemData);
+        Debug.Log($"<color=cyan>[Pickup] Đã thu hồi {comp.itemData.itemName} về Balo [B]!</color>");
+
+        // Nếu vật phẩm này thuộc về một Bàn máy (Desk Slot), giải phóng slot trên bàn
+        if (comp.parentDesk != null)
+        {
+            comp.parentDesk.VacateSlot(comp.itemData.type);
+        }
+
+        // Nếu nhặt chính cái Bàn máy, thu hồi toàn bộ linh kiện trên bàn về Balo luôn
+        if (comp.itemData.type == ComponentType.Desk)
+        {
+            DeskStationController deskCtrl = comp.GetComponent<DeskStationController>();
+            if (deskCtrl != null)
+            {
+                deskCtrl.PickupAllAttachedAccessories(playerBackpack);
+            }
+        }
+
+        Destroy(comp.gameObject);
+        if (pickupPromptUI != null) pickupPromptUI.SetActive(false);
+    }
+
+    /// <summary>
+    /// 3. Desk Auto-Snap Slots:
+    /// Tự động bắt dính chính xác vào các khe cắm định sẵn trên bàn thay vì đặt tự do lộn xộn
+    /// </summary>
+    private void UpdateGhostPlacement()
+    {
+        Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
+        RaycastHit hit;
+
+        if (activeBuildItem.type == ComponentType.Desk)
+        {
+            // Bàn: Raycast tự do trên sàn nhà
+            if (Physics.Raycast(ray, out hit, raycastDistance, floorLayerMask))
+            {
+                activeGhostInstance.SetActive(true);
+                Vector3 placePos = hit.point;
+                activeGhostInstance.transform.position = placePos;
+
+                Vector3 camFwd = playerCamera.transform.forward;
+                camFwd.y = 0;
+                Quaternion baseRot = camFwd.sqrMagnitude > 0.01f ? Quaternion.LookRotation(camFwd) : Quaternion.identity;
+                activeGhostInstance.transform.rotation = baseRot * Quaternion.Euler(0, ghostRotationAngleY, 0);
+
+                ValidatePlacementCollision(placePos);
+                activeSnappedDesk = null;
+            }
+            else
+            {
+                isGhostPlacementValid = false;
+                ApplyGhostMaterial(ghostInvalidRedMaterial);
+            }
+        }
+        else
+        {
+            // Linh kiện PC (Monitor, PCCase, Mouse, Keyboard, Headset, Chair):
+            // Tìm Bàn máy tính gần nhất trong tầm ngắm
+            DeskStationController nearestDesk = null;
+            float minDeskDist = 4.5f;
+
+            DeskStationController[] allDesks = FindObjectsOfType<DeskStationController>();
+            foreach (var desk in allDesks)
+            {
+                float d = Vector3.Distance(playerCamera.transform.position, desk.transform.position);
+                if (d < minDeskDist)
+                {
+                    minDeskDist = d;
+                    nearestDesk = desk;
+                }
+            }
+
+            if (nearestDesk != null)
+            {
+                // Tìm Transform Slot định sẵn cho loại linh kiện này
+                Transform slotTr = nearestDesk.GetSlotTransform(activeBuildItem.type);
+                if (slotTr != null)
+                {
+                    activeGhostInstance.SetActive(true);
+                    activeGhostInstance.transform.position = slotTr.position;
+                    activeGhostInstance.transform.rotation = slotTr.rotation * Quaternion.Euler(0, ghostRotationAngleY, 0);
+
+                    // Kiểm tra khe cắm đã có đồ chưa
+                    bool isSlotOccupied = nearestDesk.IsSlotFilled(activeBuildItem.type);
+                    if (isSlotOccupied)
+                    {
+                        isGhostPlacementValid = false;
+                        ApplyGhostMaterial(ghostInvalidRedMaterial);
+                    }
+                    else
+                    {
+                        isGhostPlacementValid = true;
+                        ApplyGhostMaterial(ghostValidGreenMaterial);
+                        activeSnappedDesk = nearestDesk;
+                        activeSnappedSlotType = activeBuildItem.type;
+                        activeSnappedWorldPos = slotTr.position;
+                        activeSnappedWorldRot = activeGhostInstance.transform.rotation;
+                    }
+                }
+            }
+            else
+            {
+                // Không ngắm vào bàn nào -> Không hợp lệ!
+                isGhostPlacementValid = false;
+                activeGhostInstance.transform.position = playerCamera.transform.position + playerCamera.transform.forward * 2.5f;
+                ApplyGhostMaterial(ghostInvalidRedMaterial);
+                activeSnappedDesk = null;
+            }
+        }
+    }
+
+    private void ValidatePlacementCollision(Vector3 position)
+    {
+        Vector3 halfExtents = activeBuildItem.boxDimensions * 0.48f;
+        Collider[] overlaps = Physics.OverlapBox(
+            position,
+            halfExtents,
+            activeGhostInstance.transform.rotation,
+            obstacleLayerMask
+        );
+
+        if (overlaps.Length == 0)
+        {
+            isGhostPlacementValid = true;
+            ApplyGhostMaterial(ghostValidGreenMaterial);
+        }
+        else
+        {
+            isGhostPlacementValid = false;
+            ApplyGhostMaterial(ghostInvalidRedMaterial);
+        }
+    }
+
+    private void ApplyGhostMaterial(Material mat)
+    {
+        if (activeGhostInstance == null || mat == null) return;
+        MeshRenderer[] renderers = activeGhostInstance.GetComponentsInChildren<MeshRenderer>();
+        foreach (var r in renderers) r.material = mat;
+    }
+
+    /// <summary>
+    /// Hoàn tất lắp đặt món đồ
+    /// </summary>
+    public void TryFinalizePlacement()
+    {
+        if (!isGhostPlacementValid)
+        {
+            Debug.LogWarning("[Build Mode] Vị trí không hợp lệ!");
+            return;
+        }
+
+        // 1. Tạo vật thể thật tại đúng Transform Ghost
+        GameObject solidObj = Instantiate(
+            activeBuildItem.solidPrefab,
+            activeGhostInstance.transform.position,
+            activeGhostInstance.transform.rotation
+        );
+
+        // 2. Đảm bảo gán Interactable Layer + BoxCollider để phím [F] có thể Raycast thu hồi
+        solidObj.layer = LayerMask.NameToLayer("Interactable");
+        if (solidObj.GetComponent<Collider>() == null)
+        {
+            BoxCollider col = solidObj.AddComponent<BoxCollider>();
+            col.size = activeBuildItem.boxDimensions;
+            col.center = new Vector3(0, activeBuildItem.boxDimensions.y * 0.5f, 0);
+        }
+
+        PlacedItemComponent placedComp = solidObj.AddComponent<PlacedItemComponent>();
+        placedComp.itemData = activeBuildItem;
+
+        // 3. Nếu là Bàn máy: kích hoạt Controller và Hologram dẫn đường
+        if (activeBuildItem.type == ComponentType.Desk)
+        {
+            DeskStationController deskCtrl = solidObj.GetComponent<DeskStationController>();
+            if (deskCtrl == null) deskCtrl = solidObj.AddComponent<DeskStationController>();
+            deskCtrl.InitializeDeskSlots();
+        }
+        else if (activeSnappedDesk != null)
+        {
+            // Gắn vào khe cắm của bàn & kiểm tra hoàn thiện 5 món
+            placedComp.parentDesk = activeSnappedDesk;
+            activeSnappedDesk.SnapItemIntoSlot(activeBuildItem.type, placedComp);
+        }
+
+        // 4. Trừ vật phẩm khỏi Balo
+        playerBackpack.Remove(activeBuildItem);
+        Debug.Log($"<color=green>[Build Mode] Đã lắp đặt thành công {activeBuildItem.itemName}!</color>");
+
+        // Kiểm tra xem Balo còn đồ cùng loại không
+        HardwareItemData nextSame = playerBackpack.Find(i => i.itemId == activeBuildItem.itemId);
+        if (nextSame != null)
+        {
+            activeBuildItem = nextSame;
+        }
+        else
+        {
+            CancelBuildMode();
+        }
+    }
+
+    public void OpenHardwareShop()
+    {
+        if (hardwareShopUIPanel != null)
+        {
+            hardwareShopUIPanel.SetActive(true);
+            Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+        }
+    }
+
+    public bool BuyItemToBackpack(HardwareItemData item)
+    {
+        if (item == null) return false;
+        if (MoneyManager.Instance != null && MoneyManager.Instance.TrySpendMoney(item.price))
+        {
+            playerBackpack.Add(item);
+            return true;
+        }
+        return false;
+    }
+
+    public void ToggleBackpackUI()
+    {
+        if (backpackUIPanel == null) return;
+        bool next = !backpackUIPanel.activeSelf;
+        backpackUIPanel.SetActive(next);
+        Cursor.lockState = next ? CursorLockMode.None : CursorLockMode.Locked;
+        Cursor.visible = next;
+    }
+
+    public void EnterBuildMode(HardwareItemData item)
+    {
+        if (item == null) return;
+        if (backpackUIPanel != null) backpackUIPanel.SetActive(false);
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+
+        isInBuildMode = true;
+        activeBuildItem = item;
+        ghostRotationAngleY = 0f;
+
+        if (activeGhostInstance != null) Destroy(activeGhostInstance);
+        activeGhostInstance = item.ghostHologramPrefab != null
+            ? Instantiate(item.ghostHologramPrefab)
+            : Instantiate(item.solidPrefab);
+
+        Collider[] cols = activeGhostInstance.GetComponentsInChildren<Collider>();
+        foreach (var c in cols) c.enabled = false;
+    }
+
+    public void CancelBuildMode()
+    {
+        isInBuildMode = false;
+        activeBuildItem = null;
+        if (activeGhostInstance != null)
+        {
+            Destroy(activeGhostInstance);
+            activeGhostInstance = null;
+        }
+    }
+}
+
+/// <summary>
+/// Quản lý 5 Khe Cắm Auto-Snap, Hologram hướng dẫn & Điều kiện đón khách (isReadyForCustomer)
+/// </summary>
+public class DeskStationController : MonoBehaviour
+{
+    [Header("=== 5 Khe Cắm Định Sẵn (Transforms) ===")]
+    public Transform monitorSlot;
+    public Transform keyboardSlot;
+    public Transform mouseSlot;
+    public Transform caseSlot;
+    public Transform headsetSlot;
+    public Transform chairSlot;
+
+    [Header("=== Hologram Mờ Hướng Dẫn Vị Trí Còn Thiếu ===")]
+    public GameObject monitorHologram;
+    public GameObject keyboardHologram;
+    public GameObject mouseHologram;
+    public GameObject caseHologram;
+    public GameObject headsetHologram;
+    public GameObject chairHologram;
+
+    [Header("=== Biểu Tượng Checkmark Xanh Hoàn Thiện ===")]
+    public GameObject completeCheckmarkUI;
+
+    [Header("=== Trạng Thái Đón Khách ===")]
+    public bool isReadyForCustomer = false;
+
+    private Dictionary<HardwareShopAndPlacementSystem.ComponentType, PlacedItemComponent> filledSlots
+        = new Dictionary<HardwareShopAndPlacementSystem.ComponentType, PlacedItemComponent>();
+
+    public void InitializeDeskSlots()
+    {
+        // Ban đầu bàn chưa hoàn thiện
+        isReadyForCustomer = false;
+        if (completeCheckmarkUI != null) completeCheckmarkUI.SetActive(false);
+
+        // Hiển thị toàn bộ hologram hướng dẫn các món còn thiếu
+        SetHologramState(HardwareShopAndPlacementSystem.ComponentType.Monitor, true);
+        SetHologramState(HardwareShopAndPlacementSystem.ComponentType.Keyboard, true);
+        SetHologramState(HardwareShopAndPlacementSystem.ComponentType.Mouse, true);
+        SetHologramState(HardwareShopAndPlacementSystem.ComponentType.PCCase, true);
+        SetHologramState(HardwareShopAndPlacementSystem.ComponentType.Chair, true);
+    }
+
+    public Transform GetSlotTransform(HardwareShopAndPlacementSystem.ComponentType type)
+    {
+        switch (type)
+        {
+            case HardwareShopAndPlacementSystem.ComponentType.Monitor: return monitorSlot;
+            case HardwareShopAndPlacementSystem.ComponentType.Keyboard: return keyboardSlot;
+            case HardwareShopAndPlacementSystem.ComponentType.Mouse: return mouseSlot;
+            case HardwareShopAndPlacementSystem.ComponentType.PCCase: return caseSlot;
+            case HardwareShopAndPlacementSystem.ComponentType.Headset: return headsetSlot;
+            case HardwareShopAndPlacementSystem.ComponentType.Chair: return chairSlot;
+            default: return null;
+        }
+    }
+
+    public bool IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType type)
+    {
+        return filledSlots.ContainsKey(type) && filledSlots[type] != null;
+    }
+
+    public void SnapItemIntoSlot(HardwareShopAndPlacementSystem.ComponentType type, PlacedItemComponent itemComp)
+    {
+        filledSlots[type] = itemComp;
+        // Ẩn Hologram mờ của linh kiện này đi vì đã có đồ thật
+        SetHologramState(type, false);
+
+        ValidateReadyForCustomer();
+    }
+
+    public void VacateSlot(HardwareShopAndPlacementSystem.ComponentType type)
+    {
+        if (filledSlots.ContainsKey(type)) filledSlots.Remove(type);
+        // Hiện lại Hologram mờ để người chơi biết vị trí này đang bị thiếu
+        SetHologramState(type, true);
+
+        ValidateReadyForCustomer();
+    }
+
+    private void SetHologramState(HardwareShopAndPlacementSystem.ComponentType type, bool active)
+    {
+        switch (type)
+        {
+            case HardwareShopAndPlacementSystem.ComponentType.Monitor:
+                if (monitorHologram != null) monitorHologram.SetActive(active);
+                break;
+            case HardwareShopAndPlacementSystem.ComponentType.Keyboard:
+                if (keyboardHologram != null) keyboardHologram.SetActive(active);
+                break;
+            case HardwareShopAndPlacementSystem.ComponentType.Mouse:
+                if (mouseHologram != null) mouseHologram.SetActive(active);
+                break;
+            case HardwareShopAndPlacementSystem.ComponentType.PCCase:
+                if (caseHologram != null) caseHologram.SetActive(active);
+                break;
+            case HardwareShopAndPlacementSystem.ComponentType.Chair:
+                if (chairHologram != null) chairHologram.SetActive(active);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 4. Hardware Holograms & 'Ready to Play' Validation:
+    /// Kiểm tra xem cả 5 món chính (Monitor, Keyboard, Mouse, Case, Chair) đã được lắp đủ chưa
+    /// </summary>
+    public void ValidateReadyForCustomer()
+    {
+        bool hasMonitor = IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType.Monitor);
+        bool hasKeyboard = IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType.Keyboard);
+        bool hasMouse = IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType.Mouse);
+        bool hasCase = IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType.PCCase);
+        bool hasChair = IsSlotFilled(HardwareShopAndPlacementSystem.ComponentType.Chair);
+
+        bool all5Filled = hasMonitor && hasKeyboard && hasMouse && hasCase && hasChair;
+
+        if (all5Filled && !isReadyForCustomer)
+        {
+            isReadyForCustomer = true;
+            // Action: Wrap display logic of checkmark in a timer. Show for 2 to 3 seconds, then auto-destroy/hide!
+            if (completeCheckmarkUI != null)
+            {
+                StopAllCoroutines();
+                StartCoroutine(ShowCheckmarkTemporaryRoutine(2.5f));
+            }
+            Debug.Log("<color=green>[Bàn Máy Hoàn Thiện] Đã đủ 5/5 linh kiện! Khách NPC giờ có thể tìm đến chơi và trả tiền.</color>");
+            // Thông báo cho Customer Pathfinding Manager có thêm 1 máy khả dụng
+            CustomerQueueManager.Instance?.RegisterNewPlayableStation(this);
+        }
+        else if (!all5Filled && isReadyForCustomer)
+        {
+            isReadyForCustomer = false;
+            StopAllCoroutines();
+            if (completeCheckmarkUI != null) completeCheckmarkUI.SetActive(false);
+            Debug.LogWarning("[Bàn Máy] Bị thiếu linh kiện! Ngừng đón khách.");
+            CustomerQueueManager.Instance?.UnregisterPlayableStation(this);
+        }
+    }
+
+    /// <summary>
+    /// Hiển thị biểu tượng Checkmark xanh trong 2.5 giây rồi tự động ẩn đi
+    /// </summary>
+    private System.Collections.IEnumerator ShowCheckmarkTemporaryRoutine(float duration)
+    {
+        if (completeCheckmarkUI != null) completeCheckmarkUI.SetActive(true);
+        yield return new WaitForSeconds(duration);
+        if (completeCheckmarkUI != null) completeCheckmarkUI.SetActive(false);
+    }
+
+    public void PickupAllAttachedAccessories(List<HardwareShopAndPlacementSystem.HardwareItemData> backpack)
+    {
+        foreach (var kvp in filledSlots)
+        {
+            if (kvp.Value != null)
+            {
+                backpack.Add(kvp.Value.itemData);
+                Destroy(kvp.Value.gameObject);
+            }
+        }
+        filledSlots.Clear();
+    }
+}
+
+public class PlacedItemComponent : MonoBehaviour
+{
+    public HardwareShopAndPlacementSystem.HardwareItemData itemData;
+    public DeskStationController parentDesk;
+}
+`;
+}
 
